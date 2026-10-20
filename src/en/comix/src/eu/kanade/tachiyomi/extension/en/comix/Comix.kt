@@ -653,7 +653,11 @@ abstract class Comix :
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterId = chapter.chapterId() ?: throw Exception("Could not find the chapter id")
-        val payload = runInWebView(getChapterUrl(chapter), { it.isChapterPagesRequest() }) { passPayloadName, rejectName, _ ->
+        val payload = runInWebView(
+            getChapterUrl(chapter),
+            { it.isChapterPagesRequest() },
+            timeoutSeconds = WEBVIEW_TIMEOUT_SECONDS,
+        ) { passPayloadName, rejectName, _ ->
             "(${asset("chapter_pages.js")})(${asset("site_api.js")}, $chapterId, window.$passPayloadName, window.$rejectName);"
         }
 
@@ -684,14 +688,15 @@ abstract class Comix :
         url: String,
         isDataRequest: ((HttpUrl) -> Boolean)? = null,
         buildScript: ((passPayloadName: String) -> String)? = null,
+        timeoutSeconds: Long? = null,
         pageScript: (passPayloadName: String, rejectName: String, touchName: String) -> String = { _, _, _ -> "" },
     ): String {
-        val waitSeconds = if (isDataRequest != null) DATA_REQUEST_WAIT_SECONDS else WEBVIEW_TIMEOUT_SECONDS
+        val waitSeconds = timeoutSeconds ?: if (isDataRequest != null) DATA_REQUEST_WAIT_SECONDS else WEBVIEW_TIMEOUT_SECONDS
         val timeoutDeadline = AtomicLong(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
         val dataRequests = AtomicInteger()
         val (bridgeName, errorBridgeName, passPayloadName, rejectName) = List(4) { randomName() }
         val (touchBridgeName, touchName) = List(2) { randomName() }
-        return runWebView(timeout = Duration.INFINITE) {
+        return runWebView(timeout = timeoutSeconds?.seconds ?: Duration.INFINITE) {
             userAgent = headers["User-Agent"].orEmpty()
             blockImages = true
 
