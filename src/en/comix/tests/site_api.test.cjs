@@ -6,7 +6,6 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const script = fs.readFileSync(path.join(__dirname, "../assets/site_api.js"), "utf8");
-const pagesScript = fs.readFileSync(path.join(__dirname, "../assets/chapter_pages.js"), "utf8");
 const base = "https://comix.to/assets/build/example/dist/";
 const main = `${base}main-example.js`;
 const chunk = `${base}client-example.js`;
@@ -58,18 +57,6 @@ function clientFixture() {
     const client = { request: async (url, config) => (await transport.get(url, config)).data };
     return { client, pages, calls };
 }
-
-test("reads a chapter using the real discovery script and unchanged GET matcher", async () => {
-    const { client, pages, calls } = clientFixture();
-    const runtime = createRuntime({ exports: { [main]: { client } } });
-    const chapterPages = vm.runInContext(`(${pagesScript})`, runtime.context);
-    const result = await new Promise((resolve, reject) => {
-        chapterPages(runtime.siteApi, 12345, resolve, reject);
-    });
-    assert.deepEqual(JSON.parse(result), pages);
-    assert.equal(calls[0].url, "/chapters/12345");
-    assert.deepEqual(runtime.imports, [main]);
-});
 
 test("discovers document scripts and modulepreloads when Resource Timing is empty", async () => {
     const { client } = clientFixture();
@@ -139,15 +126,4 @@ test("counts direct function exports without treating read-only exports as mutab
     const { client } = clientFixture();
     const runtime = createRuntime({ exports: { [main]: { request: client.request } } });
     await assert.rejects(runtime.findGet(), /GET helper missing .*fn=0 root=1 get=0 call=0 data=0/);
-});
-
-test("preserves useful discovery failures through the chapter page error handler", async () => {
-    const runtime = createRuntime({ resources: [] });
-    runtime.context.document.querySelector = () => null;
-    runtime.context.window.location = { pathname: "/title/example/12345-chapter-1" };
-    const chapterPages = vm.runInContext(`(${pagesScript})`, runtime.context);
-    const result = await new Promise((resolve) => {
-        chapterPages(runtime.siteApi, 12345, () => assert.fail("Unexpected pages"), resolve);
-    });
-    assert.match(result, /^Comix API v56: no main script.*; Reader did not expose a complete long-strip page list$/);
 });

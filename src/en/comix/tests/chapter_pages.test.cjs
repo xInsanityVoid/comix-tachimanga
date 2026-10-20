@@ -4,348 +4,236 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-const script = fs.readFileSync(path.join(__dirname, "../assets/chapter_pages.js"), "utf8");
+const asset = (name) => fs.readFileSync(path.join(__dirname, "../assets", name), "utf8");
+const snapshotScript = asset("reader_snapshot.js");
+const captureScript = asset("chapter_pages.js");
 
-function runChapter(result, {
-    error,
-    readyState = "complete",
-    available = true,
-    extras = [],
-    discoveryError,
-    document = {},
-    location = { pathname: "/title/example/12345-chapter-1" },
-    onTick = () => {},
-} = {}) {
-    const calls = [];
-    const events = new Map();
-    const replies = [];
-    let elapsed = 0;
-    const client = {
-        async request(url, config) {
-            assert.equal(this, client);
-            calls.push({ url, config });
-            if (error) throw error;
-            return result;
-        },
+// Selectors match the live reader. paint() defers rendering to exercise React
+// updates between native WebView polls rather than assuming synchronous clicks.
+function fixture({ count = 118, preload = "some", progress = "Left" } = {}) {
+    const f = {
+        count, preload, progress, settings: false, reader: true,
+        pathname: "/title/example/12345-chapter-1",
+        initial: JSON.stringify({ read: { chapterId: 12345 } }),
+        calls: [], pending: [],
+        progressNumbers: Array.from({ length: count }, (_, i) => i + 1),
+        pages: Array.from({ length: count }, (_, i) => ({
+            number: i + 1,
+            url: `https://images.example/hi/page-${i + 1}?v3&r=2`,
+        })),
     };
-    const siteApi = (select) => async () => {
-        if (discoveryError) throw discoveryError;
-        return select(
-            available ? [{ owner: client, key: "request", value: client.request }, ...extras] : [],
-            (value) => value === client.request,
-        );
-    };
-    const chapterPages = vm.runInNewContext(`(${script})`, {
-        URL,
-        Date: { now: () => elapsed },
-        setTimeout(callback, milliseconds) {
-            elapsed += milliseconds;
-            onTick(elapsed);
-            queueMicrotask(callback);
-        },
-        document: {
-            readyState,
-            baseURI: "https://comix.to/title/example/12345-chapter-1",
-            querySelector: () => null,
-            querySelectorAll: () => [],
-            ...document,
-        },
-        window: {
-            location,
-            addEventListener(name, listener, options) {
-                assert.equal(options.once, true);
-                events.set(name, listener);
-            },
+    let renderedPreload = preload;
+    const radio = (value) => ({
+        value,
+        get checked() { return f.preload === value; },
+        click() {
+            f.calls.push(`preload:${value}`);
+            f.pending.push(() => { f.preload = value; renderedPreload = value; });
         },
     });
-    const completed = new Promise((resolve) => {
-        chapterPages(
-            siteApi,
-            12345,
-            (payload) => {
-                replies.push({ pages: JSON.parse(payload) });
-                resolve(replies.at(-1));
-            },
-            (message) => {
-                replies.push({ error: message });
-                resolve(replies.at(-1));
-            },
-        );
-    });
-    return { completed, calls, events, replies, elapsed: () => elapsed };
-}
-
-function readerFixture({
-    count = 118,
-    numbers = Array.from({ length: count }, (_, index) => index + 1),
-    lazy = true,
-    sourceFor = (number) => `https://images.example/hi/page-${number}?v3&token=opaque%2Bvalue`,
-} = {}) {
-    const state = {
-        now: 0,
-        scrolls: [],
-        initialData: { read: { chapterId: 12345 } },
-        location: { pathname: "/title/example/12345-chapter-1" },
-    };
-    const elements = numbers.map((number) => ({
-        source: !lazy || number <= 3 ? sourceFor(number) : null,
-        revealAt: null,
+    const progressButton = (value) => ({
         getAttribute(name) {
-            assert.equal(name, "data-page");
-            return String(number);
+            return name === "aria-label" ? `Progress bar ${value}`
+                : name === "aria-checked" ? String(f.progress === value) : null;
         },
-        querySelector(selector) {
-            assert.equal(selector, "img.rpage-page__img");
-            return this.source ? {
-                getAttribute: () => this.source,
-                complete: false,
-                naturalWidth: 0,
-            } : null;
+        click() {
+            f.calls.push(`progress:${value}`);
+            f.pending.push(() => { f.progress = value; });
         },
-        scrollIntoView(options) {
-            assert.equal(options.block, "center");
-            assert.equal(options.behavior, "instant");
-            state.scrolls.push(number);
-            if (this.revealAt === null) this.revealAt = state.now + 200;
-        },
-    }));
-    state.elements = elements;
-    state.progress = Array.from({ length: count }, (_, index) => ({
-        getAttribute: () => `Go to page ${index + 1}`,
-    }));
-    state.reader = { querySelectorAll: () => state.elements };
-    return {
-        state,
-        document: {
-            querySelectorAll(selector) {
-                assert.equal(selector, ".rpage-progress__seg");
-                return state.progress;
-            },
-            querySelector(selector) {
-                if (selector === "script#initial-data") {
-                    return state.initialData ? { textContent: JSON.stringify(state.initialData) } : null;
-                }
-                assert.equal(selector, ".rpage-main--long-strip");
-                return state.reader;
-            },
-        },
-        location: state.location,
-        onTick(elapsed) {
-            state.now = elapsed;
-            elements.forEach((element, index) => {
-                if (element.revealAt !== null && elapsed >= element.revealAt) {
-                    element.source = sourceFor(numbers[index]);
-                }
-            });
+    });
+    const progressButtons = ["Left", "Top", "Bottom", "Right", "Off"].map(progressButton);
+    const reader = {
+        querySelectorAll(selector) {
+            assert.equal(selector, ".rpage-page[data-page]");
+            return f.pages.map((page) => ({
+                getAttribute: () => String(page.number),
+                querySelector(selector) {
+                    assert.equal(selector, "img.rpage-page__img");
+                    if (renderedPreload !== "all" && page.number > 3) return null;
+                    return { getAttribute: () => page.url };
+                },
+            }));
         },
     };
+    const document = {
+        baseURI: "https://comix.to/title/example/12345-chapter-1",
+        querySelector(selector) {
+            if (selector === "script#initial-data") return f.initial === null ? null : { textContent: f.initial };
+            if (selector === ".rpage-main") return f.reader ? reader : null;
+            if (selector === ".rpage-progress__seg") return f.progress !== "Off" && f.count ? {} : null;
+            if (selector === 'button[aria-label="Settings"]') return {
+                click() { f.calls.push("open"); f.pending.push(() => { f.settings = true; }); },
+            };
+            if (!f.settings) return null;
+            if (selector === 'button[aria-label="Close settings"]') return {
+                click() { f.calls.push("close"); f.pending.push(() => { f.settings = false; }); },
+            };
+            if (selector === 'input[name="preload"]:checked') return f.preload ? radio(f.preload) : null;
+            const value = selector.match(/^input\[name="preload"\]\[value="(.*)"\]$/)?.[1];
+            if (value) return radio(value);
+            if (selector === '[aria-label="Progress bar position"] [aria-checked="true"]') return progressButton(f.progress);
+            if (selector === 'button[aria-label="Progress bar Left"]') return progressButtons[0];
+            throw new Error(`Unexpected selector: ${selector}`);
+        },
+        querySelectorAll(selector) {
+            if (selector === ".rpage-progress__seg") return f.progress === "Off" ? [] : f.progressNumbers.map((n) => ({
+                getAttribute: () => `Go to page ${n}`,
+            }));
+            if (selector === '[aria-label="Progress bar position"] [role="radio"]') return f.settings ? progressButtons : [];
+            throw new Error(`Unexpected selector: ${selector}`);
+        },
+    };
+    const context = vm.createContext({
+        URL, document,
+        window: { location: { get pathname() { return f.pathname; } } },
+    });
+    const snapshot = vm.runInContext(`(${snapshotScript})`, context);
+    const capture = vm.runInContext(`(${captureScript})`, context);
+    f.state = {};
+    const plain = (value) => JSON.parse(JSON.stringify(value));
+    f.read = () => plain(snapshot(12345));
+    f.tick = () => plain(capture(snapshot, 12345, f.state));
+    f.paint = () => { f.pending.splice(0).forEach((apply) => apply()); };
+    f.finish = () => {
+        for (let i = 0; i < 15; i++) {
+            const result = f.tick();
+            f.paint();
+            if (result.status !== "waiting") return result;
+        }
+        assert.fail("Reader never finished");
+    };
+    return f;
 }
 
-test("reads pages when the GET helper is exported without a route function", async () => {
-    const pages = {
-        baseUrl: "https://images.example",
-        items: [{ url: "one.webp", s: 1 }],
-        alt: ["backup.example"],
-        node: "n1",
-    };
-    const run = runChapter(pages);
-    assert.deepEqual(await run.completed, { pages });
-    assert.equal(run.calls.length, 1);
-    assert.equal(run.calls[0].url, "/chapters/12345");
-    assert.equal(run.calls[0].config.params, undefined);
+test("captures all 118 pages in order, preserving final hosts, paths and queries", () => {
+    const f = fixture({ preload: "all" });
+    f.pages.reverse();
+    const result = f.read();
+    assert.equal(result.status, "ready");
+    assert.equal(result.count, 118);
+    assert.deepEqual(result.items.map((x) => x.number), Array.from({ length: 118 }, (_, i) => i + 1));
+    assert.equal(result.items[117].url, "https://images.example/hi/page-118?v3&r=2");
 });
 
-test("does not depend on the route function's source representation", async () => {
-    const route = function renamedRoute(id) { return "/chapters/" + id; };
-    const pages = { items: [{ url: "https://images.example/one.webp" }] };
-    const run = runChapter(pages, {
-        extras: [{ owner: { route }, key: "route", value: route }],
-    });
-    assert.deepEqual(await run.completed, { pages });
+test("does not return a partial chapter when lazy images are missing", () => {
+    assert.deepEqual(fixture().read(), { status: "waiting", stage: "loading image addresses (3/118)" });
 });
 
-test("retains page metadata from a wrapped response", async () => {
-    const pages = {
-        items: [{ url: "one.webp" }, { url: "two.webp" }],
-        baseUrl: "https://images.example",
-        alt: ["backup.example"],
-    };
-    const run = runChapter({ renamedPages: pages, metadata: { id: 12345 } });
-    assert.deepEqual(await run.completed, { pages });
+test("waits for a missing final page wrapper", () => {
+    const f = fixture({ preload: "all" });
+    f.pages.pop();
+    assert.deepEqual(f.read(), { status: "waiting", stage: "rendering pages (117/118)" });
 });
 
-test("accepts bare page arrays and wrapped page arrays", async () => {
-    const items = [{ url: "https://images.example/one.webp" }];
-    for (const result of [items, { renamedPages: items }]) {
-        assert.deepEqual(await runChapter(result).completed, { pages: { items } });
+test("requires the reader's total count even when images are present", () => {
+    assert.equal(fixture({ preload: "all", progress: "Off" }).read().status, "waiting");
+    assert.equal(fixture({ count: 0, preload: "all" }).read().status, "waiting");
+});
+
+test("rejects duplicate or skipped page numbers", () => {
+    const f = fixture({ preload: "all" });
+    f.pages[117].number = 117;
+    assert.match(f.read().error, /numbering/);
+});
+
+test("rejects inconsistent progress numbering", () => {
+    const f = fixture({ preload: "all" });
+    f.progressNumbers[117] = 119;
+    assert.match(f.read().error, /page count/);
+});
+
+test("does not return another chapter after navigation", () => {
+    const f = fixture({ preload: "all" });
+    f.pathname = "/title/example/99999-chapter-2";
+    assert.match(f.read().error, /different chapter/);
+    f.pathname = "/title/example/12345-chapter-1";
+    f.initial = JSON.stringify({ read: { chapterId: 99999 } });
+    assert.match(f.read().error, /different chapter/);
+});
+
+test("distinguishes loading, non-reader and malformed initial documents", () => {
+    const f = fixture();
+    f.initial = null;
+    assert.equal(f.read().stage, "loading the chapter document");
+    f.initial = "{}";
+    assert.equal(f.read().stage, "opening the chapter reader");
+    f.initial = "invalid";
+    assert.match(f.read().error, /initial data is invalid/);
+    f.initial = JSON.stringify({ read: { chapterId: 12345 } });
+    f.reader = false;
+    assert.equal(f.read().stage, "rendering the chapter");
+});
+
+test("rejects blob/canvas placeholders instead of inventing an image URL", () => {
+    const f = fixture({ preload: "all" });
+    for (const url of ["blob:https://comix.to/id", "data:image/png;base64,AAAA", "javascript:void(0)"]) {
+        f.pages[0].url = url;
+        assert.match(f.read().error, /unsupported image format/);
+    }
+    f.pages[0].url = "https://[invalid";
+    assert.match(f.read().error, /invalid image URL/);
+});
+
+test("resolves relative image addresses against the reader document", () => {
+    const f = fixture({ preload: "all" });
+    f.pages[0].url = "/image.webp?version=3";
+    assert.equal(f.read().items[0].url, "https://comix.to/image.webp?version=3");
+});
+
+test("uses Preload all, captures 118 pages and restores the previous preference", () => {
+    const f = fixture();
+    const result = f.finish();
+    assert.equal(result.status, "ready");
+    assert.equal(result.items.length, 118);
+    assert.equal(result.items[117].number, 118);
+    assert.deepEqual(f.calls, ["open", "preload:all", "preload:some", "close"]);
+    assert.equal(f.preload, "some");
+    assert.equal(f.settings, false);
+    assert.equal(f.read().status, "waiting"); // Copy survives restoring lazy loading.
+});
+
+test("temporarily enables the page count and restores progress Off", () => {
+    const f = fixture({ progress: "Off" });
+    assert.equal(f.finish().items.length, 118);
+    assert.deepEqual(f.calls, ["open", "preload:all", "progress:Left", "preload:some", "progress:Off", "close"]);
+    assert.equal(f.progress, "Off");
+});
+
+test("leaves complete short chapters and existing Preload all preferences untouched", () => {
+    for (const options of [{ count: 2 }, { preload: "all" }]) {
+        const f = fixture(options);
+        assert.equal(f.finish().status, "ready");
+        assert.deepEqual(f.calls, []);
     }
 });
 
-test("rejects a missing helper and missing reader without issuing a request", async () => {
-    const run = runChapter(null, { available: false });
-    assert.deepEqual(await run.completed, {
-        error: "Could not find the site's chapter API; Reader did not expose a complete long-strip page list",
-    });
-    assert.equal(run.calls.length, 0);
-    assert.equal(run.elapsed(), 90000);
+test("does not close a settings panel that was already open", () => {
+    const f = fixture();
+    f.settings = true;
+    assert.equal(f.finish().status, "ready");
+    assert.equal(f.settings, true);
+    assert.deepEqual(f.calls, ["preload:all", "preload:some"]);
 });
 
-test("rejects malformed and empty page responses", async () => {
-    for (const result of [null, {}, { items: [] }, { items: [{ url: 42 }] }]) {
-        assert.deepEqual(await runChapter(result).completed, {
-            error: "Chapter pages came back in a shape the extension doesn't recognise",
-        });
-    }
+test("waits for delayed settings rendering without toggling it closed", () => {
+    const f = fixture();
+    assert.equal(f.tick().status, "waiting");
+    assert.equal(f.tick().status, "waiting");
+    assert.deepEqual(f.calls, ["open"]);
+    f.paint();
+    assert.equal(f.finish().status, "ready");
 });
 
-test("reports HTTP and transport errors from the site's helper", async () => {
-    assert.deepEqual(await runChapter(null, {
-        error: { response: { status: 502 }, message: "Bad gateway" },
-    }).completed, { error: "Chapter pages failed: HTTP 502" });
-    assert.deepEqual(await runChapter(null, {
-        error: new Error("Connection interrupted"),
-    }).completed, { error: "Chapter pages failed: Connection interrupted" });
+test("reports a missing preload setting rather than returning partial pages", () => {
+    const f = fixture({ preload: null });
+    f.settings = true;
+    assert.match(f.tick().error, /preload setting is missing/);
 });
 
-test("waits for the page to load before discovering its API", async () => {
-    const pages = { items: [{ url: "https://images.example/one.webp" }] };
-    const run = runChapter(pages, { readyState: "loading" });
-    assert.equal(run.calls.length, 0);
-    assert.equal(run.events.has("load"), true);
-    run.events.get("load")();
-    assert.deepEqual(await run.completed, { pages });
-});
-
-test("collects all 118 lazy pages in numeric order without waiting for image loads", async () => {
-    const fixture = readerFixture({ numbers: Array.from({ length: 118 }, (_, index) => 118 - index) });
-    const run = runChapter(null, { available: false, ...fixture });
-    const result = await run.completed;
-    assert.equal(result.pages.items.length, 118);
-    assert.equal(result.pages.items[0].url, "https://images.example/hi/page-1?v3&token=opaque%2Bvalue");
-    assert.equal(result.pages.items[117].url, "https://images.example/hi/page-118?v3&token=opaque%2Bvalue");
-    assert.equal(run.replies.length, 1);
-    assert.equal(run.calls.length, 0);
-    assert.ok(fixture.state.scrolls.includes(118));
-    assert.ok(run.elapsed() < 90000);
-});
-
-test("uses the reader after a discovery error and accepts repeated image URLs", async () => {
-    const fixture = readerFixture({ count: 2, sourceFor: () => "https://images.example/repeated.jpg" });
-    const run = runChapter(null, { discoveryError: new Error("Comix API v56: GET helper missing"), ...fixture });
-    assert.deepEqual(await run.completed, {
-        pages: { items: [
-            { url: "https://images.example/repeated.jpg" },
-            { url: "https://images.example/repeated.jpg" },
-        ] },
-    });
-});
-
-test("does not fall back when a discovered API request fails or returns malformed data", async () => {
-    const fixture = readerFixture({ count: 1 });
-    const requestFailure = await runChapter(null, {
-        error: { response: { status: 502 } },
-        ...fixture,
-    }).completed;
-    assert.equal(requestFailure.error, "Chapter pages failed: HTTP 502");
-    const malformed = await runChapter({ items: [] }, fixture).completed;
-    assert.equal(malformed.error, "Chapter pages came back in a shape the extension doesn't recognise");
-    assert.equal(fixture.state.scrolls.length, 0);
-});
-
-test("rejects missing, duplicate and noninteger reader page labels", async () => {
-    for (const numbers of [[1, 3], [1, 1], [1, 2.5], [0, 1]]) {
-        const fixture = readerFixture({ numbers, lazy: false });
-        const result = await runChapter(null, { available: false, ...fixture }).completed;
-        assert.match(result.error, /Reader page numbering is incomplete$/);
-    }
-});
-
-test("never returns partial pages when a URL stays missing, blob or data", async () => {
-    for (const missing of [null, "blob:https://comix.to/local", "data:image/png;base64,AAAA"]) {
-        const fixture = readerFixture({ count: 4, sourceFor: (number) => (
-            number === 4 ? missing : `https://images.example/${number}.webp`
-        ) });
-        const run = runChapter(null, {
-            discoveryError: new Error("Comix API v56: no main script"),
-            ...fixture,
-        });
-        assert.deepEqual(await run.completed, {
-            error: "Comix API v56: no main script; Reader exposed 3 of 4 HTTP page URLs",
-        });
-        assert.equal(run.replies.length, 1);
-        assert.equal(run.elapsed(), 90000);
-    }
-});
-
-test("rejects initial reader data for a different chapter", async () => {
-    const fixture = readerFixture({ count: 1 });
-    fixture.state.initialData.read.chapterId = 54321;
-    const result = await runChapter(null, { available: false, ...fixture }).completed;
-    assert.match(result.error, /Reader opened a different chapter$/);
-    assert.equal(fixture.state.scrolls.length, 0);
-});
-
-test("can read when initial reader data is absent", async () => {
-    const fixture = readerFixture({ count: 1 });
-    fixture.state.initialData = null;
-    const result = await runChapter(null, { available: false, ...fixture }).completed;
-    assert.equal(result.pages.items.length, 1);
-});
-
-test("rejects navigation, reader replacement or page count changes during collection", async () => {
-    for (const change of [
-        (state) => { state.location.pathname = "/title/example/54321-chapter-2"; },
-        (state) => { state.reader = { querySelectorAll: () => state.elements }; },
-        (state) => { state.elements = state.elements.slice(0, 3); },
-        (state) => { state.initialData.read.chapterId = 54321; },
-    ]) {
-        const fixture = readerFixture({ count: 4 });
-        const result = await runChapter(null, {
-            available: false,
-            ...fixture,
-            onTick(elapsed) {
-                fixture.onTick(elapsed);
-                if (elapsed === 600) change(fixture.state);
-            },
-        }).completed;
-        assert.match(result.error, /Reader (?:changed|page count changed|opened a different)/);
-    }
-});
-
-test("waits for the placeholder count to settle before collecting", async () => {
-    const fixture = readerFixture({ count: 5, lazy: false });
-    const allPages = fixture.state.elements;
-    fixture.state.elements = allPages.slice(0, 3);
-    const run = runChapter(null, {
-        available: false,
-        ...fixture,
-        onTick(elapsed) {
-            fixture.onTick(elapsed);
-            if (elapsed === 300) fixture.state.elements = allPages;
-        },
-    });
-    assert.equal((await run.completed).pages.items.length, 5);
-    assert.equal(run.elapsed(), 800);
-});
-
-test("does not return a stable partial wrapper list that is smaller than reader progress", async () => {
-    const fixture = readerFixture({ count: 118, lazy: false });
-    fixture.state.elements = fixture.state.elements.slice(0, 3);
-    const run = runChapter(null, { available: false, ...fixture });
-    assert.match((await run.completed).error, /Reader did not expose a complete long-strip page list$/);
-    assert.equal(run.elapsed(), 90000);
-    assert.equal(run.replies.length, 1);
-});
-
-test("requires complete, unique progress labels and a long-strip reader", async () => {
-    for (const change of [
-        (state) => { state.progress = []; },
-        (state) => { state.progress = [state.progress[0], state.progress[0]]; },
-        (state) => { state.reader = null; },
-    ]) {
-        const fixture = readerFixture({ count: 2, lazy: false });
-        change(fixture.state);
-        const result = await runChapter(null, { available: false, ...fixture }).completed;
-        assert.match(result.error, /Reader (?:did not expose a complete long-strip page list|progress numbering is incomplete)$/);
-    }
+test("rejects chapter changes while finishing capture", () => {
+    const f = fixture();
+    for (let i = 0; i < 3; i++) { f.tick(); f.paint(); }
+    assert.ok(f.state.result);
+    f.pathname = "/title/example/99999-chapter-2";
+    assert.match(f.tick().error, /different chapter/);
 });

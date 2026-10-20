@@ -319,30 +319,6 @@ class Chapter(
     }
 }
 
-@Serializable
-class ChapterPages(
-    val baseUrl: String = "",
-    val items: List<PageDto>,
-    private val alt: List<String>? = null,
-    private val node: String? = null,
-) {
-    // Alt hosts in the site reader's retry order
-    fun altHosts(host: String, index: Int): List<String> {
-        if (alt.isNullOrEmpty()) return emptyList()
-        val label = host.substringBefore('.')
-        val start = index % alt.size
-        val domains = alt.drop(start) + alt.take(start)
-        val hosts = domains.map { "$label.$it" } + domains.map { "${node ?: label}.$it" }
-        return List(6) { hosts[it % hosts.size] }
-    }
-
-    @Serializable
-    class PageDto(
-        val url: String,
-        val s: Int = 0,
-    )
-}
-
 private val DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
 
 // Relative site date ("2w ago"); with latest, the latest time the text can stand for

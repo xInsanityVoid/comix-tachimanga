@@ -35,13 +35,10 @@ import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
 import okio.Buffer
 import org.json.JSONObject
-import java.io.IOException
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.random.Random
@@ -65,30 +62,6 @@ abstract class Comix :
     }
 
     override fun OkHttpClient.Builder.configureClient() = addInterceptor(Descrambler.interceptor)
-        .addInterceptor(::altHostFallback)
-        .addInterceptor { chain ->
-            val request = chain.request()
-            if (request.url.fragment?.startsWith(ALT_HOSTS_FRAGMENT) == true || request.url.host == baseUrlHost) {
-                return@addInterceptor chain.proceed(request)
-            }
-
-            var response = proceedWithRetry(chain, request)
-            if (response.isSuccessful) return@addInterceptor response
-
-            val url = request.url.toString()
-            val fallbacks = listOf("/hi/", "/fcf/", "/i5/", "/si/", "/i/", "/sii/", "/ii/")
-                .map { url.replaceFirst(SCRAMBLE_PATH_FALLBACK_REGEX, it) }
-                .filter { it != url }
-
-            if (fallbacks.isEmpty()) return@addInterceptor response
-
-            for (fallbackUrl in fallbacks) {
-                response.close()
-                response = proceedWithRetry(chain, request.newBuilder().url(fallbackUrl).build())
-                if (response.isSuccessful) break
-            }
-            response
-        }
         .rateLimit(2) { it.host == baseUrlHost }
         .rateLimit(5)
 
@@ -107,65 +80,6 @@ abstract class Comix :
             }
             if (waitNanos > 0) Thread.sleep(waitNanos / 1_000_000)
         }
-    }
-
-    // Retry failed images on alt hosts, like the site's reader
-    private fun altHostFallback(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        val altHosts = request.url.altHosts()
-        if (altHosts.isEmpty()) return chain.proceed(request)
-
-        val urls = listOf(request.url) + altHosts.mapIndexed { i, host ->
-            request.url.newBuilder()
-                .host(host)
-                .setQueryParameter("r", (i + 1).toString())
-                .build()
-        }
-        var failed: Response? = null
-        var error: IOException? = null
-        for (url in urls) {
-            if (failed != null) {
-                failed.close()
-                failed = null
-                runCatching { Thread.sleep(2000) }
-            }
-            try {
-                val response = chain.proceed(request.newBuilder().url(url).build())
-                if (response.isSuccessful) return response
-                failed = response
-            } catch (e: IOException) {
-                if (chain.call().isCanceled()) throw e
-                error = e
-            }
-        }
-        return failed ?: throw error!!
-    }
-
-    private fun HttpUrl.altHosts(): List<String> = fragment
-        ?.takeIf { it.startsWith(ALT_HOSTS_FRAGMENT) }
-        ?.removePrefix(ALT_HOSTS_FRAGMENT)
-        ?.split(',')
-        .orEmpty()
-
-    private fun proceedWithRetry(chain: Interceptor.Chain, request: Request): Response {
-        var response = chain.proceed(request)
-        if (response.isSuccessful) return response
-
-        for (attempt in 1..10) {
-            if (response.code !in SERVER_ERROR_CODES && response.code != 404) break
-
-            response.close()
-            runCatching { Thread.sleep(1500) }
-
-            val urlBuilder = request.url.newBuilder()
-                .setQueryParameter("r", attempt.toString())
-
-            val retryUrl = urlBuilder.build()
-            response = chain.proceed(request.newBuilder().url(retryUrl).build())
-            if (response.isSuccessful) break
-        }
-
-        return response
     }
 
     override fun Headers.Builder.configureHeaders() = add("Accept", "*/*")
@@ -653,32 +567,7 @@ abstract class Comix :
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterId = chapter.chapterId() ?: throw Exception("Could not find the chapter id")
-        val payload = runInWebView(
-            getChapterUrl(chapter),
-            { it.isChapterPagesRequest() },
-            timeoutSeconds = WEBVIEW_TIMEOUT_SECONDS,
-        ) { passPayloadName, rejectName, _ ->
-            "(${asset("chapter_pages.js")})(${asset("site_api.js")}, $chapterId, window.$passPayloadName, window.$rejectName);"
-        }
-
-        return buildPages(payload.parseAs())
-    }
-
-    private fun buildPages(pages: ChapterPages): List<Page> {
-        val base = pages.baseUrl.trimEnd('/')
-        return pages.items.mapIndexed { index, img ->
-            val full = (if (img.url.startsWith("http")) img.url else "$base/${img.url.trimStart('/')}").toHttpUrl()
-            // V3 pages need the query flag so the server returns grid-scramble headers
-            val isV3 = img.s == 1 || "v3" in full.queryParameterNames
-            val url = full.newBuilder().apply {
-                if (isV3 && "v3" !in full.queryParameterNames) {
-                    addQueryParameter("v3", null)
-                }
-                val altHosts = pages.altHosts(full.host, index)
-                if (altHosts.isNotEmpty()) fragment(ALT_HOSTS_FRAGMENT + altHosts.joinToString(","))
-            }.build().toString()
-            Page(index, imageUrl = url)
-        }
+        return Reader.pages(getChapterUrl(chapter), chapterId, headers["User-Agent"].orEmpty())
     }
 
     override fun getFilterList(data: JsonElement?) = sourceFilters().getFilterList()
@@ -688,15 +577,14 @@ abstract class Comix :
         url: String,
         isDataRequest: ((HttpUrl) -> Boolean)? = null,
         buildScript: ((passPayloadName: String) -> String)? = null,
-        timeoutSeconds: Long? = null,
         pageScript: (passPayloadName: String, rejectName: String, touchName: String) -> String = { _, _, _ -> "" },
     ): String {
-        val waitSeconds = timeoutSeconds ?: if (isDataRequest != null) DATA_REQUEST_WAIT_SECONDS else WEBVIEW_TIMEOUT_SECONDS
+        val waitSeconds = if (isDataRequest != null) DATA_REQUEST_WAIT_SECONDS else WEBVIEW_TIMEOUT_SECONDS
         val timeoutDeadline = AtomicLong(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
         val dataRequests = AtomicInteger()
         val (bridgeName, errorBridgeName, passPayloadName, rejectName) = List(4) { randomName() }
         val (touchBridgeName, touchName) = List(2) { randomName() }
-        return runWebView(timeout = timeoutSeconds?.seconds ?: Duration.INFINITE) {
+        return runWebView(timeout = Duration.INFINITE) {
             userAgent = headers["User-Agent"].orEmpty()
             blockImages = true
 
@@ -787,11 +675,6 @@ abstract class Comix :
         .joinToString("")
 
     private fun asset(name: String) = javaClass.getResource("/assets/$name")!!.readText()
-
-    private fun HttpUrl.isChapterPagesRequest(): Boolean = pathSegments.size == 4 &&
-        pathSegments[0] == "api" &&
-        pathSegments[1] == "v1" &&
-        pathSegments[2] == "chapters"
 
     private fun HttpUrl.isChapterListRequest(): Boolean = pathSegments.size == 5 &&
         pathSegments[0] == "api" &&
@@ -988,9 +871,6 @@ abstract class Comix :
         private val chapterListPacer = RequestPacer(minGapMs = 2500, maxGapMs = 5000)
         private const val OFFICIAL_GROUP_ID = 10702
         private const val TAG_ID_CACHE_SIZE = 50
-        private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
-        private val SERVER_ERROR_CODES = setOf(502, 503, 522, 523)
-        private const val ALT_HOSTS_FRAGMENT = "alt="
 
         // Site requests in the WebView that the extension has no use for: error reports, comments, upload images
         private val UNUSED_SITE_PATHS = listOf("/api/v1/client-errors", "/api/v1/threads/", "/assets/uploads/")
