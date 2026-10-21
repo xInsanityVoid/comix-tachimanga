@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.webkit.WebResourceResponse
 import android.widget.Toast
 import androidx.preference.EditTextPreference
@@ -23,6 +24,7 @@ import keiyoushi.annotation.Source
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.NativeWebViewApi
+import keiyoushi.utils.WebViewTimeoutException
 import keiyoushi.utils.booleanOrNull
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
@@ -31,6 +33,7 @@ import keiyoushi.utils.intOrNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.runWebView
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -713,76 +716,138 @@ abstract class Comix :
         val timeoutDeadline = System.nanoTime() + WEBVIEW_TIMEOUT_SECONDS.seconds.inWholeNanoseconds
         val dataRequests = AtomicInteger()
         val (bridgeName, errorBridgeName, passPayloadName, rejectName) = List(4) { randomName() }
-        return runWebView(timeout = WEBVIEW_TIMEOUT_SECONDS.seconds) {
-            userAgent = headers["User-Agent"].orEmpty()
-            blockImages = true
+        var lastDocumentState = "not observed"
+        try {
+            return runWebView(timeout = WEBVIEW_TIMEOUT_SECONDS.seconds) {
+                userAgent = headers["User-Agent"].orEmpty()
+                blockImages = true
 
-            val emptyResponse = WebResourceResponse("text/plain", "utf-8", Buffer().inputStream())
-            interceptRequest { request ->
-                val requestUrl = request.url?.toString()?.toHttpUrlOrNull()
-                    ?: return@interceptRequest emptyResponse
-                if (UNUSED_SITE_PATHS.any(requestUrl.encodedPath::startsWith)) return@interceptRequest emptyResponse
+                val emptyResponse = WebResourceResponse("text/plain", "utf-8", Buffer().inputStream())
+                interceptRequest { request ->
+                    val requestUrl = request.url?.toString()?.toHttpUrlOrNull()
+                        ?: return@interceptRequest emptyResponse
+                    if (UNUSED_SITE_PATHS.any(requestUrl.encodedPath::startsWith)) return@interceptRequest emptyResponse
 
-                val isFrameLoad = request.requestHeaders["Accept"].orEmpty().contains("text/html")
-                if (requestUrl.encodedPath == WAF_CHALLENGE_PATH && isFrameLoad) {
-                    if (!preferences.solveCaptchas()) {
-                        reject(Exception("Open in WebView to solve the captcha, or turn on \"Solve captchas\" in extension settings"))
-                        return@interceptRequest emptyResponse
+                    val isFrameLoad = request.requestHeaders["Accept"].orEmpty().contains("text/html")
+                    if (requestUrl.encodedPath == WAF_CHALLENGE_PATH && isFrameLoad) {
+                        if (!preferences.solveCaptchas()) {
+                            reject(Exception("Open in WebView to solve the captcha, or turn on \"Solve captchas\" in extension settings"))
+                            return@interceptRequest emptyResponse
+                        }
+                        val page = "<script>(${asset("polyfill.js")})(parent.$rejectName)</script>"
+                        return@interceptRequest WebResourceResponse("text/html", "utf-8", page.byteInputStream())
                     }
-                    val page = "<script>(${asset("polyfill.js")})(parent.$rejectName)</script>"
-                    return@interceptRequest WebResourceResponse("text/html", "utf-8", page.byteInputStream())
+                    val isData = isDataRequest?.invoke(requestUrl) == true
+                    if (isData) dataRequests.incrementAndGet()
+                    val allowed = requestUrl.host == baseUrlHost ||
+                        requestUrl.host.endsWith(".$baseUrlHost") ||
+                        requestUrl.host == "comix.to" ||
+                        requestUrl.host.endsWith(".comix.to") ||
+                        requestUrl.host == "comix.ws" ||
+                        requestUrl.host.endsWith(".comix.ws") ||
+                        requestUrl.host == "challenges.cloudflare.com"
+                    if (allowed) null else emptyResponse
                 }
-                val isData = isDataRequest?.invoke(requestUrl) == true
-                if (isData) dataRequests.incrementAndGet()
-                val allowed = requestUrl.host == baseUrlHost ||
-                    requestUrl.host.endsWith(".$baseUrlHost") ||
-                    requestUrl.host == "comix.to" ||
-                    requestUrl.host.endsWith(".comix.to") ||
-                    requestUrl.host == "comix.ws" ||
-                    requestUrl.host.endsWith(".comix.ws") ||
-                    requestUrl.host == "challenges.cloudflare.com"
-                if (allowed) null else emptyResponse
-            }
 
-            jsBridge(bridgeName) { resolve(it) }
-            jsBridge(errorBridgeName) { reject(Exception(it)) }
-            val siteOrigin = url.toHttpUrl().run { "$scheme://$host" }
-            withNativeWebView { it.settings.setSupportMultipleWindows(true) }
+                jsBridge(bridgeName) { resolve(it) }
+                jsBridge(errorBridgeName) { reject(Exception(it)) }
+                val siteOrigin = url.toHttpUrl().run { "$scheme://$host" }
+                withNativeWebView { it.settings.setSupportMultipleWindows(true) }
 
-            val captureScript = buildScript?.invoke(passPayloadName)
-            if (captureScript != null) {
-                onPageStarted { evaluateJs(captureScript) }
-                onPageFinished { evaluateJs(captureScript) }
-            }
-            poll(SCRIPT_RETRY_INTERVAL_MS.milliseconds) {
-                if (System.nanoTime() >= timeoutDeadline) {
-                    val message = when {
-                        isDataRequest == null -> "Timed out waiting for WebView"
-                        dataRequests.get() == 0 -> "Site never requested the data"
-                        else -> "Nothing read from ${dataRequests.get()} site requests"
+                val captureScript = buildScript?.invoke(passPayloadName)
+                fun capturePayload() {
+                    if (captureScript == null) return
+                    evaluateJs(captureScript) { value ->
+                        // A cached result can precede the document-start bridge on non-Chromium hosts.
+                        val payload = runCatching {
+                            value.parseAs<JsonPrimitive>().takeIf { it.isString }?.content
+                                ?.also { it.parseAs<SearchResponse>() }
+                        }.getOrNull() ?: return@evaluateJs
+                        resolve(payload)
                     }
-                    reject(Exception(message))
-                } else if (captureScript != null) {
-                    evaluateJs(captureScript)
                 }
+
+                val documentStateScript = "(${asset("document-state.js")})(${JSONObject.quote(passPayloadName)})"
+                fun observeDocumentState() {
+                    evaluateJs(documentStateScript) { value ->
+                        val state = runCatching {
+                            value.parseAs<JsonPrimitive>().takeIf { it.isString }?.content
+                                ?.parseAs<DocumentState>()
+                        }.getOrNull() ?: return@evaluateJs
+                        val summary = state.summary()
+                        if (summary != lastDocumentState) {
+                            lastDocumentState = summary
+                            Log.i("Comix", "1.6.69 WebView: $summary")
+                        }
+                        when {
+                            state.ready == DocumentReady.COMPLETE && state.kind == DocumentKind.THIRD_PARTY_BLOCK ->
+                                reject(IOException("Comix: this browser received the site's third-party-app block ($summary)"))
+                            state.ready == DocumentReady.COMPLETE && state.kind == DocumentKind.HTTP_503 ->
+                                reject(IOException("Comix: the WebView document returned HTTP 503 ($summary)"))
+                        }
+                    }
+                }
+
+                if (captureScript != null) {
+                    onPageStarted { capturePayload() }
+                    onPageFinished { capturePayload() }
+                }
+                onPageFinished { observeDocumentState() }
+                poll(1.seconds) { observeDocumentState() }
+                poll(SCRIPT_RETRY_INTERVAL_MS.milliseconds) {
+                    if (System.nanoTime() >= timeoutDeadline) {
+                        val message = when {
+                            isDataRequest == null -> "Timed out waiting for WebView"
+                            dataRequests.get() == 0 -> "Site never requested the data"
+                            else -> "Nothing read from ${dataRequests.get()} site requests"
+                        }
+                        reject(Exception("$message ($lastDocumentState)"))
+                    } else if (captureScript != null) {
+                        capturePayload()
+                    }
+                }
+
+                val startFlagName = "window.${randomName()}"
+                val bootstrapScript = """
+                    (() => {
+                    if (window.top !== window || $startFlagName) return;
+                    $startFlagName = true;
+
+                    try { localStorage.setItem("__pu1", "[" + Date.now() + "]"); } catch (e) {}
+                    window.$passPayloadName = payload => window.$bridgeName.post(payload);
+                    window.$rejectName = message => window.$errorBridgeName.post(message);
+                    ${pageScript(passPayloadName, rejectName)}
+                    })();
+                """.trimIndent()
+                injectAtDocumentStart(bootstrapScript, setOf(siteOrigin))
+                loadUrl(url)
             }
-
-            val startFlagName = "window.${randomName()}"
-            val bootstrapScript = """
-                (() => {
-                if (window.top !== window || $startFlagName) return;
-                $startFlagName = true;
-
-                try { localStorage.setItem("__pu1", "[" + Date.now() + "]"); } catch (e) {}
-                window.$passPayloadName = payload => window.$bridgeName.post(payload);
-                window.$rejectName = message => window.$errorBridgeName.post(message);
-                ${pageScript(passPayloadName, rejectName)}
-                })();
-            """.trimIndent()
-            injectAtDocumentStart(bootstrapScript, setOf(siteOrigin))
-            loadUrl(url)
+        } catch (error: WebViewTimeoutException) {
+            throw IOException("Comix: WebView timed out ($lastDocumentState; requests=${dataRequests.get()})", error)
         }
     }
+
+    @Serializable
+    private class DocumentState(
+        val ready: DocumentReady,
+        val kind: DocumentKind,
+        val status: Int,
+        private val body: Boolean,
+        private val initialData: Boolean,
+        private val scripts: Int,
+        private val bridge: Boolean,
+        private val browsePayload: Boolean,
+    ) {
+        fun summary() = "ready=$ready kind=$kind status=${status.takeIf { it in 100..599 } ?: 0} " +
+            "body=$body initialData=$initialData scripts=${scripts.coerceIn(0, 10000)} " +
+            "bridge=$bridge browsePayload=$browsePayload"
+    }
+
+    @Serializable
+    private enum class DocumentReady { LOADING, INTERACTIVE, COMPLETE, UNKNOWN }
+
+    @Serializable
+    private enum class DocumentKind { THIRD_PARTY_BLOCK, CLOUDFLARE_CHALLENGE, HTTP_503, CONTENT, UNKNOWN }
 
     private fun randomName() = (1..(10..20).random())
         .map { (('a'..'z') + ('A'..'Z')).random() }
