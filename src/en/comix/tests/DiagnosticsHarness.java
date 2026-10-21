@@ -29,8 +29,9 @@ public final class DiagnosticsHarness {
             check(error instanceof IOException, "null failure was not contextualized");
             check(error.getCause() == original, "original cause was lost");
             check(error.getMessage().contains("native tap"), "stage missing");
-            check(error.getMessage().contains("host.WebView.tap(WebView.java:42)"), "stack location missing");
-            check(!error.getMessage().contains("source.More"), "stack is not bounded");
+            check(error.getMessage().contains("WebView.tap:42"), "stack location missing");
+            check(error.getMessage().indexOf("WebView.tap:42") < 64, "first frame is too late for a cropped error");
+            check(!error.getMessage().contains("More.invoke"), "stack is not bounded");
         }
         for (RuntimeException originalError : new RuntimeException[] {
                 new CancellationException("cancel"), new IllegalStateException("site error")}) {
@@ -41,7 +42,12 @@ public final class DiagnosticsHarness {
                 check(error == originalError, "unrelated error was changed");
             }
         }
-        System.out.println("PASS: successful returns, null context/cause/stack, cancellation and other errors");
+        check(!DiagnosticsKt.isHtmlRequest(null), "missing request headers must not crash");
+        check(!DiagnosticsKt.isHtmlRequest(java.util.Map.of()), "missing Accept is not HTML");
+        check(DiagnosticsKt.isHtmlRequest(java.util.Map.of("Accept", "text/html,application/xhtml+xml")), "HTML request not recognized");
+        check(DiagnosticsKt.isHtmlRequest(java.util.Map.of("accept", "TEXT/HTML")), "header case should not matter");
+        check(!DiagnosticsKt.isHtmlRequest(java.util.Map.of("Accept", "application/json")), "JSON mistaken for a document");
+        System.out.println("PASS: diagnostics preserve behavior; null/missing/case-insensitive request headers handled");
     }
 
     private static void check(boolean condition, String message) {

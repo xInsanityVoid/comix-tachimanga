@@ -575,7 +575,7 @@ abstract class Comix :
         isDataRequest: ((HttpUrl) -> Boolean)? = null,
         buildScript: ((passPayloadName: String) -> String)? = null,
         pageScript: (passPayloadName: String, rejectName: String, touchName: String) -> String = { _, _, _ -> "" },
-    ): String = comixStep("configuring or running the WebView") {
+    ): String = comixStep("WebView run") {
         val page = comixStep("fetching the WebView document") { WebPage.fetch(client, url, headers) }
         val waitSeconds = if (isDataRequest != null) DATA_REQUEST_WAIT_SECONDS else WEBVIEW_TIMEOUT_SECONDS
         val timeoutDeadline = AtomicLong(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
@@ -583,87 +583,108 @@ abstract class Comix :
         val (bridgeName, errorBridgeName, passPayloadName, rejectName) = List(4) { randomName() }
         val (touchBridgeName, touchName) = List(2) { randomName() }
         runWebView(timeout = Duration.INFINITE) {
-            userAgent = page.userAgent
-            blockImages = true
+            var setupStep = "user agent"
+            try {
+                userAgent = page.userAgent
+                setupStep = "image settings"
+                blockImages = true
 
-            val emptyResponse = WebResourceResponse("text/plain", "utf-8", Buffer().inputStream())
-            interceptRequest { request ->
-                val requestUrl = request.url?.toString()?.toHttpUrlOrNull()
-                    ?: return@interceptRequest emptyResponse
-                if (UNUSED_SITE_PATHS.any(requestUrl.encodedPath::startsWith)) return@interceptRequest emptyResponse
-                // The solver's own request for this path reads the site's page
-                val isFrameLoad = request.requestHeaders["Accept"].orEmpty().contains("text/html")
-                if (requestUrl.encodedPath == WAF_CHALLENGE_PATH && isFrameLoad) {
-                    if (!preferences.solveCaptchas()) {
-                        reject(Exception("Open in WebView to solve the captcha, or turn on \"Solve captchas\" in extension settings"))
-                        return@interceptRequest emptyResponse
-                    }
-                    val page = "<script>(${asset("solve_captcha.js")})(parent.$rejectName)</script>"
-                    return@interceptRequest WebResourceResponse("text/html", "utf-8", page.byteInputStream())
-                }
-                val isData = isDataRequest?.invoke(requestUrl) == true
-                if (isData) dataRequests.incrementAndGet()
-                if (requestUrl.isChapterListRequest()) chapterListPacer.waitForSlot()
-                if (isData || requestUrl.encodedPath.startsWith(WAF_PATH)) {
-                    timeoutDeadline.set(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
-                }
-                val allowed = requestUrl.host == baseUrlHost ||
-                    requestUrl.host.endsWith(".$baseUrlHost") ||
-                    requestUrl.host == "comix.to" ||
-                    requestUrl.host.endsWith(".comix.to") ||
-                    requestUrl.host == "comix.ws" ||
-                    requestUrl.host.endsWith(".comix.ws") ||
-                    requestUrl.host == "challenges.cloudflare.com"
-                if (allowed) null else emptyResponse
-            }
-
-            jsBridge(bridgeName) { resolve(it) }
-            jsBridge(errorBridgeName) { reject(Exception(it)) }
-            val siteOrigin = page.url.toHttpUrl().run { "$scheme://$host" }
-            webMessageBridge(touchBridgeName, setOf(siteOrigin)) { message ->
-                val points = message.split(',').mapNotNull { it.toFloatOrNull() }
-                // Pagination progress must not depend on an internal API URL shape.
-                if (points.size == 2 || points.size == 4) {
-                    timeoutDeadline.set(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
-                }
-                when (points.size) {
-                    2 -> try {
-                        tap(points[0], points[1])
+                setupStep = "request handler"
+                val emptyResponse = WebResourceResponse("text/plain", "utf-8", Buffer().inputStream())
+                interceptRequest { request ->
+                    try {
+                        val requestUrl = request.url?.toString()?.toHttpUrlOrNull()
+                            ?: return@interceptRequest emptyResponse
+                        if (UNUSED_SITE_PATHS.any(requestUrl.encodedPath::startsWith)) return@interceptRequest emptyResponse
+                        // The solver's own request for this path reads the site's page
+                        val isFrameLoad = isHtmlRequest(request.requestHeaders)
+                        if (requestUrl.encodedPath == WAF_CHALLENGE_PATH && isFrameLoad) {
+                            if (!preferences.solveCaptchas()) {
+                                reject(Exception("Open in WebView to solve the captcha, or turn on \"Solve captchas\" in extension settings"))
+                                return@interceptRequest emptyResponse
+                            }
+                            val page = "<script>(${asset("solve_captcha.js")})(parent.$rejectName)</script>"
+                            return@interceptRequest WebResourceResponse("text/html", "utf-8", page.byteInputStream())
+                        }
+                        val isData = isDataRequest?.invoke(requestUrl) == true
+                        if (isData) dataRequests.incrementAndGet()
+                        if (requestUrl.isChapterListRequest()) chapterListPacer.waitForSlot()
+                        if (isData || requestUrl.encodedPath.startsWith(WAF_PATH)) {
+                            timeoutDeadline.set(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
+                        }
+                        val allowed = requestUrl.host == baseUrlHost ||
+                            requestUrl.host.endsWith(".$baseUrlHost") ||
+                            requestUrl.host == "comix.to" ||
+                            requestUrl.host.endsWith(".comix.to") ||
+                            requestUrl.host == "comix.ws" ||
+                            requestUrl.host.endsWith(".comix.ws") ||
+                            requestUrl.host == "challenges.cloudflare.com"
+                        if (allowed) null else emptyResponse
                     } catch (error: NullPointerException) {
-                        reject(nullFailure("dispatching a native WebView tap", error))
+                        reject(nullFailure("request handler", error))
+                        emptyResponse
                     }
-                    4 -> try {
-                        swipe(points[0], points[1], points[2], points[3])
+                }
+
+                setupStep = "result bridges"
+                jsBridge(bridgeName) { resolve(it) }
+                jsBridge(errorBridgeName) { reject(Exception(it)) }
+                val siteOrigin = page.url.toHttpUrl().run { "$scheme://$host" }
+                setupStep = "touch bridge"
+                webMessageBridge(touchBridgeName, setOf(siteOrigin)) { message ->
+                    val points = message.split(',').mapNotNull { it.toFloatOrNull() }
+                    // Pagination progress must not depend on an internal API URL shape.
+                    if (points.size == 2 || points.size == 4) {
+                        timeoutDeadline.set(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
+                    }
+                    when (points.size) {
+                        2 -> try {
+                            tap(points[0], points[1])
+                        } catch (error: NullPointerException) {
+                            reject(nullFailure("native tap", error))
+                        }
+                        4 -> try {
+                            swipe(points[0], points[1], points[2], points[3])
+                        } catch (error: NullPointerException) {
+                            reject(nullFailure("native swipe", error))
+                        }
+                        else -> throw Exception("Bad touch from the page: $message")
+                    }
+                }
+                // Refuse the site's first-tap ad window
+                setupStep = "popup settings"
+                withNativeWebView {
+                    try {
+                        it.settings.setSupportMultipleWindows(true)
                     } catch (error: NullPointerException) {
-                        reject(nullFailure("dispatching a native WebView swipe", error))
+                        reject(nullFailure("popup settings", error))
                     }
-                    else -> throw Exception("Bad touch from the page: $message")
                 }
-            }
-            // Refuse the site's first-tap ad window
-            withNativeWebView { it.settings.setSupportMultipleWindows(true) }
 
-            val captureScript = buildScript?.invoke(passPayloadName)
-            if (captureScript != null) {
-                onPageStarted { evaluateJs(captureScript) }
-                onPageFinished { evaluateJs(captureScript) }
-            }
-            poll(SCRIPT_RETRY_INTERVAL_MS.milliseconds) {
-                if (System.nanoTime() >= timeoutDeadline.get()) {
-                    val message = when {
-                        isDataRequest == null -> "Timed out waiting for WebView"
-                        dataRequests.get() == 0 -> "Site never requested the data"
-                        else -> "Nothing read from ${dataRequests.get()} site requests"
+                setupStep = "capture script"
+                val captureScript = buildScript?.invoke(passPayloadName)
+                if (captureScript != null) {
+                    onPageStarted { evaluateJs(captureScript) }
+                    onPageFinished { evaluateJs(captureScript) }
+                }
+                setupStep = "poll setup"
+                poll(SCRIPT_RETRY_INTERVAL_MS.milliseconds) {
+                    if (System.nanoTime() >= timeoutDeadline.get()) {
+                        val message = when {
+                            isDataRequest == null -> "Timed out waiting for WebView"
+                            dataRequests.get() == 0 -> "Site never requested the data"
+                            else -> "Nothing read from ${dataRequests.get()} site requests"
+                        }
+                        reject(Exception(message))
+                    } else if (captureScript != null) {
+                        evaluateJs(captureScript)
                     }
-                    reject(Exception(message))
-                } else if (captureScript != null) {
-                    evaluateJs(captureScript)
                 }
-            }
 
-            // The site's current build flags foreign inline head scripts, so inject with no element left behind
-            val startFlagName = "window.${randomName()}"
-            val bootstrapScript = """
+                // The site's current build flags foreign inline head scripts, so inject with no element left behind
+                setupStep = "bootstrap script"
+                val startFlagName = "window.${randomName()}"
+                val bootstrapScript = """
                 (() => {
                 if (window.top !== window || $startFlagName) return;
                 $startFlagName = true;
@@ -674,9 +695,14 @@ abstract class Comix :
                 window.$touchName = points => window.$touchBridgeName.postMessage(points.join(","));
                 ${pageScript(passPayloadName, rejectName, touchName)}
                 })();
-            """.trimIndent()
-            injectAtDocumentStart(bootstrapScript, setOf(siteOrigin))
-            loadData(page.url, page.html)
+                """.trimIndent()
+                setupStep = "document injection"
+                injectAtDocumentStart(bootstrapScript, setOf(siteOrigin))
+                setupStep = "load HTML"
+                loadData(page.url, page.html)
+            } catch (error: NullPointerException) {
+                reject(nullFailure(setupStep, error))
+            }
         }
     }
 
@@ -685,7 +711,7 @@ abstract class Comix :
         .joinToString("")
 
     private fun asset(name: String) = requireNotNull(javaClass.getResource("/assets/$name")) {
-        "Comix 1.6.60: the app could not open packaged resource $name"
+        "Comix61: missing resource $name"
     }.readText()
 
     private fun HttpUrl.isChapterListRequest(): Boolean = pathSegments.size == 5 &&

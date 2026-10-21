@@ -66,36 +66,42 @@ private class Finger {
 
     @OptIn(NativeWebViewApi::class)
     fun send(scope: WebViewScope<*>, action: Int, x: Float, y: Float) = scope.withNativeWebView { view ->
-        val metrics = view.resources.displayMetrics
-        // Some vendors report a bogus xdpi; fall back to the density bucket then
-        val pxPerMm = (metrics.xdpi.takeIf { it in 100f..1000f } ?: metrics.densityDpi.toFloat()) / 25.4f
-        if (action == MotionEvent.ACTION_DOWN) downTime = SystemClock.uptimeMillis()
-        // Contact and pressure shift a little while the finger moves
-        fun drift(spread: Double) = if (action == MotionEvent.ACTION_MOVE) Random.nextDouble(1 - spread, 1 + spread).toFloat() else 1f
-        // A real first touch has pointer id 0
-        val properties = MotionEvent.PointerProperties().apply {
-            id = 0
-            toolType = MotionEvent.TOOL_TYPE_FINGER
-        }
-        val coords = MotionEvent.PointerCoords().apply {
-            this.x = x * metrics.density
-            this.y = y * metrics.density
-            this.pressure = (pressure * drift(0.25)).coerceIn(0.05f, 1f)
-            touchMajor = majorMm * pxPerMm * drift(0.15)
-            touchMinor = (majorMm * minorRatio * pxPerMm * drift(0.15)).coerceAtMost(touchMajor)
-            toolMajor = touchMajor
-            toolMinor = touchMinor
-            this.orientation = orientation
-            size = touchMajor / maxOf(metrics.widthPixels, metrics.heightPixels)
-        }
-        val event = MotionEvent.obtain(
-            downTime, SystemClock.uptimeMillis(), action, 1, arrayOf(properties), arrayOf(coords),
-            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0,
-        )
         try {
-            view.dispatchTouchEvent(event)
-        } finally {
-            event.recycle()
+            val metrics = requireNotNull(view.resources?.displayMetrics) {
+                "Comix61: native touch display metrics unavailable"
+            }
+            // Some vendors report a bogus xdpi; fall back to the density bucket then
+            val pxPerMm = (metrics.xdpi.takeIf { it in 100f..1000f } ?: metrics.densityDpi.toFloat()) / 25.4f
+            if (action == MotionEvent.ACTION_DOWN) downTime = SystemClock.uptimeMillis()
+            // Contact and pressure shift a little while the finger moves
+            fun drift(spread: Double) = if (action == MotionEvent.ACTION_MOVE) Random.nextDouble(1 - spread, 1 + spread).toFloat() else 1f
+            // A real first touch has pointer id 0
+            val properties = MotionEvent.PointerProperties().apply {
+                id = 0
+                toolType = MotionEvent.TOOL_TYPE_FINGER
+            }
+            val coords = MotionEvent.PointerCoords().apply {
+                this.x = x * metrics.density
+                this.y = y * metrics.density
+                this.pressure = (pressure * drift(0.25)).coerceIn(0.05f, 1f)
+                touchMajor = majorMm * pxPerMm * drift(0.15)
+                touchMinor = (majorMm * minorRatio * pxPerMm * drift(0.15)).coerceAtMost(touchMajor)
+                toolMajor = touchMajor
+                toolMinor = touchMinor
+                this.orientation = orientation
+                size = touchMajor / maxOf(metrics.widthPixels, metrics.heightPixels)
+            }
+            val event = MotionEvent.obtain(
+                downTime, SystemClock.uptimeMillis(), action, 1, arrayOf(properties), arrayOf(coords),
+                0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0,
+            )
+            try {
+                view.dispatchTouchEvent(event)
+            } finally {
+                event.recycle()
+            }
+        } catch (error: NullPointerException) {
+            scope.reject(nullFailure("native touch event", error))
         }
     }
 }
@@ -103,22 +109,26 @@ private class Finger {
 // Touches sent before the page has drawn are dropped, so wait up to a second for its next frame
 @OptIn(NativeWebViewApi::class)
 private fun WebViewScope<*>.whenDrawn(block: () -> Unit) = withNativeWebView { view ->
-    val handler = Handler(Looper.getMainLooper())
-    var started = false
-    val start = Runnable {
-        if (!started) {
-            started = true
-            block()
-        }
-    }
-    handler.postDelayed(start, 1000)
-    view.postVisualStateCallback(
-        0,
-        object : WebView.VisualStateCallback() {
-            override fun onComplete(requestId: Long) {
-                handler.removeCallbacks(start)
-                start.run()
+    try {
+        val handler = Handler(Looper.getMainLooper())
+        var started = false
+        val start = Runnable {
+            if (!started) {
+                started = true
+                block()
             }
-        },
-    )
+        }
+        handler.postDelayed(start, 1000)
+        view.postVisualStateCallback(
+            0,
+            object : WebView.VisualStateCallback() {
+                override fun onComplete(requestId: Long) {
+                    handler.removeCallbacks(start)
+                    start.run()
+                }
+            },
+        )
+    } catch (error: NullPointerException) {
+        reject(nullFailure("native draw callback", error))
+    }
 }

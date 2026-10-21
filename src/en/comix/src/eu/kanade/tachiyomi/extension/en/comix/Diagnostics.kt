@@ -10,8 +10,12 @@ internal suspend fun <T> comixStep(stage: String, block: suspend () -> T): T = t
 }
 
 internal fun nullFailure(stage: String, error: NullPointerException): IOException {
-    val location = error.stackTrace.take(3).joinToString("\n") {
-        "${it.className}.${it.methodName}(${it.fileName ?: "unknown"}:${it.lineNumber})"
+    val location = error.stackTrace.take(3).joinToString(" > ") {
+        "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
     }
-    return IOException("Comix 1.6.60: $stage failed (NullPointerException)\n$location", error)
+    return IOException("Comix61 NPE [$stage] $location", error)
 }
+
+internal fun isHtmlRequest(headers: Map<String, String>?): Boolean = headers?.entries?.any {
+    it.key.equals("Accept", ignoreCase = true) && it.value.contains("text/html", ignoreCase = true)
+} == true
