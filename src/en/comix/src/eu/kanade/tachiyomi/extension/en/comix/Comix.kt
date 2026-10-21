@@ -583,8 +583,10 @@ abstract class Comix :
         val (bridgeName, errorBridgeName, passPayloadName, rejectName) = List(4) { randomName() }
         val (touchBridgeName, touchName) = List(2) { randomName() }
         runWebView(timeout = Duration.INFINITE) {
-            var setupStep = "user agent"
+            var setupStep = "viewport layout"
             try {
+                configureViewport()
+                setupStep = "user agent"
                 userAgent = page.userAgent
                 setupStep = "image settings"
                 blockImages = true
@@ -686,16 +688,17 @@ abstract class Comix :
                 setupStep = "bootstrap script"
                 val startFlagName = "window.${randomName()}"
                 val bootstrapScript = """
-                (() => {
+                (async () => {
                 if (window.top !== window || $startFlagName) return;
                 $startFlagName = true;
                 // Mark the site's ad overlay as already shown so it never covers the page
                 try { localStorage.setItem("__pu1", "[" + Date.now() + "]"); } catch (e) {}
                 window.$passPayloadName = payload => window.$bridgeName.post(payload);
                 window.$rejectName = message => window.$errorBridgeName.post(message);
-                    window.$touchName = points => window.$touchBridgeName.postMessage([window.innerWidth, ...points].join(","));
+                window.$touchName = points => window.$touchBridgeName.postMessage([window.innerWidth, ...points].join(","));
+                await (${asset("viewport_ready.js")})();
                 ${pageScript(passPayloadName, rejectName, touchName)}
-                })();
+                })().catch(error => window.$rejectName(error.message || String(error)));
                 """.trimIndent()
                 setupStep = "document injection"
                 injectAtDocumentStart(bootstrapScript, setOf(siteOrigin))
@@ -712,7 +715,7 @@ abstract class Comix :
         .joinToString("")
 
     private fun asset(name: String) = requireNotNull(javaClass.getResource("/assets/$name")) {
-        "Comix61: missing resource $name"
+        "Comix63: missing resource $name"
     }.readText()
 
     private fun HttpUrl.isChapterListRequest(): Boolean = pathSegments.size == 5 &&
