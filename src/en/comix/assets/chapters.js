@@ -16,17 +16,26 @@
     const validChapter = (chapter) => chapter && Number.isSafeInteger(chapter.id) && chapter.id > 0
         && typeof chapter.number === "number" && Number.isFinite(chapter.number)
         && typeof chapter.url === "string" && chapter.url.includes(chapterPath);
+    const findRequestInitializer = (namespace, owner, getOwner) => {
+        const exports = Object.values(namespace || {});
+        if (!exports.includes(owner) || !exports.includes(getOwner)) throw new Error("Could not find the site's chapter client module");
+        const initializers = [...new Set(exports.filter((value) => typeof value === "function"
+            && /^function(?:\s+[A-Za-z_$][\w$]*)?\s*\(\s*\)\s*\{\s*[A-Za-z_$][\w$]*\s*=\s*Date\s*\.\s*now\s*\(\s*\)\s*;?\s*\}$/.test(Function.prototype.toString.call(value))))];
+        if (initializers.length !== 1) throw new Error("Could not find a unique chapter request initializer in the site's client module");
+        return initializers[0];
+    };
     const run = async () => {
         if (document.readyState === "loading") {
             await new Promise((ready) => document.addEventListener("DOMContentLoaded", ready, { once: true }));
         }
-        if (document.title === "Third-party apps are not supported") throw new Error("Comix blocked this browser session. Open the series in WebView.");
-        const findApi = discover((entries, isGet) => {
+        if (document.title === "Third-party apps are not supported") throw new Error("Comix blocked this browser session before chapter loading.");
+        const findApi = discover((entries, isGet, namespace) => {
             const method = entries.find((entry) => chapterMethod(entry.value));
             const get = entries.find((entry) => isGet(entry.value));
             if (!method || !get) return null;
+            const initializeRequest = findRequestInitializer(namespace, method.owner, get.owner);
             const records = [];
-            const original = get.value;
+            const original = get.owner[get.key];
             const wrapped = async (path, options) => {
                 const matching = path === `/manga/${mangaId}/chapters`;
                 try {
@@ -40,10 +49,11 @@
             };
             get.owner[get.key] = wrapped;
             restore = () => { get.owner[get.key] = original; };
-            return { method: method.value, owner: method.owner, records };
+            return { method: method.value, owner: method.owner, initializeRequest, records };
         });
         const api = await findApi();
         if (!api) throw new Error("Could not find the site's chapters API");
+        const initializeRequest = api.initializeRequest;
         const chapters = [];
         const seen = new Set();
         let total = null;
@@ -51,9 +61,11 @@
         for (let page = 1; page <= 1000; page++) {
             api.records.length = 0;
             let requestError;
-            const requestParams = { page, limit: requestedLimit, order: { created_at: "desc" }, v: "0" };
+            const requestParams = { page, limit: requestedLimit, order: { created_at: "desc" } };
             try {
-                // Hidden WebViews do not produce the trusted input events used by the client's v bookkeeping.
+                // The client reads its activity timestamp when calculating pagination flags.
+                // Use the module's setter; do not override flags or clear a flagged session.
+                initializeRequest();
                 await api.method.call(api.owner, mangaId, requestParams);
             } catch (error) { requestError = error; }
             const record = api.records.find((item) => item.params === requestParams);
