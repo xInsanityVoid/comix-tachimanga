@@ -20,7 +20,6 @@ const val CHAPTER_LIST_DEDUPLICATED_MEMO = "chapterListDeduplicated"
 const val CHAPTER_LIST_BLACKLIST_MEMO = "chapterListBlacklist"
 const val CHAPTER_LIST_COMPLETE_MEMO = "chapterListComplete"
 const val CHAPTER_LIST_FETCHED_AT_MEMO = "chapterListFetchedAt"
-const val CHAPTER_LIST_READER_VERSION_MEMO = "chapterListReaderVersion"
 
 @Serializable
 class Term(
@@ -207,7 +206,6 @@ class Manga(
         return knownLinks + unknownLinks
     }
 
-    // Tags are separate from the curated genres in the site's detail UI.
     private fun getGenres(showTags: Boolean) = buildList {
         when (type) {
             "manhwa" -> add("Manhwa")
@@ -320,9 +318,32 @@ class Chapter(
     }
 }
 
+@Serializable
+class ChapterPages(
+    val baseUrl: String = "",
+    val items: List<PageDto>,
+    private val alt: List<String>? = null,
+    private val node: String? = null,
+) {
+
+    fun altHosts(host: String, index: Int): List<String> {
+        if (alt.isNullOrEmpty()) return emptyList()
+        val label = host.substringBefore('.')
+        val start = index % alt.size
+        val domains = alt.drop(start) + alt.take(start)
+        val hosts = domains.map { "$label.$it" } + domains.map { "${node ?: label}.$it" }
+        return List(6) { hosts[it % hosts.size] }
+    }
+
+    @Serializable
+    class PageDto(
+        val url: String,
+        val s: Int = 0,
+    )
+}
+
 private val DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
 
-// Relative site date ("2w ago"); with latest, the latest time the text can stand for
 fun parseRelativeDate(dateStr: String, latest: Boolean = false): Long {
     if (dateStr.isEmpty()) return 0L
     val trimmed = dateStr.trim().lowercase().removeSuffix(" ago")
