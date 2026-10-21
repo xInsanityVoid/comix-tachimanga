@@ -632,19 +632,20 @@ abstract class Comix :
                 val siteOrigin = page.url.toHttpUrl().run { "$scheme://$host" }
                 setupStep = "touch bridge"
                 webMessageBridge(touchBridgeName, setOf(siteOrigin)) { message ->
-                    val points = message.split(',').mapNotNull { it.toFloatOrNull() }
+                    val input = TouchInput.parse(message)
+                    val points = input.points
                     // Pagination progress must not depend on an internal API URL shape.
                     if (points.size == 2 || points.size == 4) {
                         timeoutDeadline.set(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
                     }
                     when (points.size) {
                         2 -> try {
-                            tap(points[0], points[1])
+                            tap(points[0], points[1], input.viewportWidth)
                         } catch (error: NullPointerException) {
                             reject(nullFailure("native tap", error))
                         }
                         4 -> try {
-                            swipe(points[0], points[1], points[2], points[3])
+                            swipe(points[0], points[1], points[2], points[3], input.viewportWidth)
                         } catch (error: NullPointerException) {
                             reject(nullFailure("native swipe", error))
                         }
@@ -692,7 +693,7 @@ abstract class Comix :
                 try { localStorage.setItem("__pu1", "[" + Date.now() + "]"); } catch (e) {}
                 window.$passPayloadName = payload => window.$bridgeName.post(payload);
                 window.$rejectName = message => window.$errorBridgeName.post(message);
-                window.$touchName = points => window.$touchBridgeName.postMessage(points.join(","));
+                    window.$touchName = points => window.$touchBridgeName.postMessage([window.innerWidth, ...points].join(","));
                 ${pageScript(passPayloadName, rejectName, touchName)}
                 })();
                 """.trimIndent()

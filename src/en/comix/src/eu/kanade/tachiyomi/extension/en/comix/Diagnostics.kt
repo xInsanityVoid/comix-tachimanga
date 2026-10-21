@@ -13,7 +13,7 @@ internal fun nullFailure(stage: String, error: NullPointerException): IOExceptio
     val location = error.stackTrace.take(3).joinToString(" > ") {
         "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
     }
-    return IOException("Comix61 NPE [$stage] $location", error)
+    return IOException("Comix62 NPE [$stage] $location", error)
 }
 
 internal fun isHtmlRequest(headers: Map<String, String>?): Boolean = headers?.entries?.any {

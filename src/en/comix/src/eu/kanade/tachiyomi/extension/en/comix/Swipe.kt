@@ -8,7 +8,6 @@ import android.view.MotionEvent
 import android.webkit.WebView
 import keiyoushi.utils.NativeWebViewApi
 import keiyoushi.utils.WebViewScope
-import kotlin.math.PI
 import kotlin.math.pow
 import kotlin.random.Random
 
@@ -16,9 +15,9 @@ import kotlin.random.Random
  * Swipes from ([fromX], [fromY]) to ([toX], [toY]) in CSS pixels the way a finger does: about half a second,
  * starting slowly and tailing off, with a fingertip's contact. Stops when the run ends.
  */
-internal fun WebViewScope<*>.swipe(fromX: Float, fromY: Float, toX: Float, toY: Float) {
+internal fun WebViewScope<*>.swipe(fromX: Float, fromY: Float, toX: Float, toY: Float, viewportWidth: Float) {
     val frames = Random.nextInt(25, 37)
-    val finger = Finger()
+    val finger = Finger(viewportWidth)
     val handler = Handler(Looper.getMainLooper())
 
     fun send(frame: Int) {
@@ -35,8 +34,8 @@ internal fun WebViewScope<*>.swipe(fromX: Float, fromY: Float, toX: Float, toY: 
 }
 
 /** Taps ([x], [y]) in CSS pixels the way a finger does: a short press that barely moves. */
-internal fun WebViewScope<*>.tap(x: Float, y: Float) {
-    val finger = Finger()
+internal fun WebViewScope<*>.tap(x: Float, y: Float, viewportWidth: Float) {
+    val finger = Finger(viewportWidth)
     val handler = Handler(Looper.getMainLooper())
     val moves = Random.nextInt(0, 3)
     val stepMs = Random.nextLong(70, 130) / (moves + 1)
@@ -57,45 +56,25 @@ internal fun WebViewScope<*>.tap(x: Float, y: Float) {
 }
 
 /** One fingertip's contact, sent to the WebView as touchscreen events. */
-private class Finger {
-    private val majorMm = Random.nextDouble(7.0, 10.5).toFloat()
-    private val minorRatio = Random.nextDouble(0.6, 0.95).toFloat()
-    private val pressure = Random.nextDouble(0.25, 0.55).toFloat()
-    private val orientation = Random.nextDouble(-PI / 2, PI / 2).toFloat()
+private class Finger(private val viewportWidth: Float) {
     private var downTime = 0L
 
     @OptIn(NativeWebViewApi::class)
     fun send(scope: WebViewScope<*>, action: Int, x: Float, y: Float) = scope.withNativeWebView { view ->
         try {
-            val metrics = requireNotNull(view.resources?.displayMetrics) {
-                "Comix61: native touch display metrics unavailable"
-            }
-            // Some vendors report a bogus xdpi; fall back to the density bucket then
-            val pxPerMm = (metrics.xdpi.takeIf { it in 100f..1000f } ?: metrics.densityDpi.toFloat()) / 25.4f
+            // Match browser CSS coordinates to the actual host view, without Android Resources.
+            val scale = touchScale(viewportWidth, view.width)
             if (action == MotionEvent.ACTION_DOWN) downTime = SystemClock.uptimeMillis()
-            // Contact and pressure shift a little while the finger moves
-            fun drift(spread: Double) = if (action == MotionEvent.ACTION_MOVE) Random.nextDouble(1 - spread, 1 + spread).toFloat() else 1f
-            // A real first touch has pointer id 0
-            val properties = MotionEvent.PointerProperties().apply {
-                id = 0
-                toolType = MotionEvent.TOOL_TYPE_FINGER
-            }
-            val coords = MotionEvent.PointerCoords().apply {
-                this.x = x * metrics.density
-                this.y = y * metrics.density
-                this.pressure = (pressure * drift(0.25)).coerceIn(0.05f, 1f)
-                touchMajor = majorMm * pxPerMm * drift(0.15)
-                touchMinor = (majorMm * minorRatio * pxPerMm * drift(0.15)).coerceAtMost(touchMajor)
-                toolMajor = touchMajor
-                toolMinor = touchMinor
-                this.orientation = orientation
-                size = touchMajor / maxOf(metrics.widthPixels, metrics.heightPixels)
-            }
             val event = MotionEvent.obtain(
-                downTime, SystemClock.uptimeMillis(), action, 1, arrayOf(properties), arrayOf(coords),
-                0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0,
+                downTime,
+                SystemClock.uptimeMillis(),
+                action,
+                x * scale,
+                y * scale,
+                0,
             )
             try {
+                event.source = InputDevice.SOURCE_TOUCHSCREEN
                 view.dispatchTouchEvent(event)
             } finally {
                 event.recycle()
