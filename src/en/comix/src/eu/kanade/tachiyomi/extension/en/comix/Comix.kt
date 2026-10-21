@@ -176,7 +176,10 @@ abstract class Comix :
         return response
     }
 
-    override fun Headers.Builder.configureHeaders() = add("Accept", "*/*")
+    override fun Headers.Builder.configureHeaders() = apply {
+        add("Accept", "*/*")
+        get("User-Agent")?.let { set("User-Agent", comixUserAgent(it)) }
+    }
 
     override suspend fun getPopularManga(page: Int): MangasPage {
         val url = baseUrl.toHttpUrl().newBuilder().apply {
@@ -777,7 +780,7 @@ abstract class Comix :
                         val summary = state.summary()
                         if (summary != lastDocumentState) {
                             lastDocumentState = summary
-                            Log.i("Comix", "1.6.69 WebView: $summary")
+                            Log.i("Comix", "1.6.70 WebView: $summary")
                         }
                         when {
                             state.ready == DocumentReady.COMPLETE && state.kind == DocumentKind.THIRD_PARTY_BLOCK ->
