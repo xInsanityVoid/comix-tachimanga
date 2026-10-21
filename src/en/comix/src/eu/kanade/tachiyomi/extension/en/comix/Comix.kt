@@ -332,7 +332,7 @@ abstract class Comix :
         chapters: List<SChapter>,
         fetchDetails: Boolean,
         fetchChapters: Boolean,
-    ): SMangaUpdate {
+    ): SMangaUpdate = comixStep("initializing a series update") {
         var cachedQueries: JsonObject? = null
         suspend fun getQueries(): JsonObject {
             cachedQueries?.let { return it }
@@ -360,7 +360,7 @@ abstract class Comix :
             }.toMap()
             val mangaSlug = manga.url.removePrefix("/")
             val fetchStartedAt = System.currentTimeMillis()
-            val chapterList = getWebViewChapterList(manga, knownIds)
+            val chapterList = comixStep("reading the chapter list") { getWebViewChapterList(manga, knownIds) }
             // The chapter page carried the detail too, so the manga comes from this same navigation
             walkedQueries = chapterList.queries?.also {
                 cachedQueries = it
@@ -369,8 +369,10 @@ abstract class Comix :
             if (!chapterList.complete) {
                 throw Exception(chapterList.error ?: "Chapter list is incomplete")
             }
-            val fetched = chapterList.chapters.map { it.toSChapter(mangaSlug) }.onEach { chapter ->
-                chapter.chapterId()?.let(knownDates::get)?.let { chapter.date_upload = it }
+            val fetched = comixStep("converting chapter metadata") {
+                chapterList.chapters.map { it.toSChapter(mangaSlug) }.onEach { chapter ->
+                    chapter.chapterId()?.let(knownDates::get)?.let { chapter.date_upload = it }
+                }
             }
             // Only a complete newest-first walk can update the stored chapter list.
             val candidates = if (fetchUntilKnown) fetched + chapters else fetched
@@ -395,8 +397,10 @@ abstract class Comix :
             walked != null -> walked.mangaDetail()
             else -> getQueries().mangaDetail()
         }
-        val updatedManga = detail?.takeIf { fetchDetails }?.let(::parseMangaDetails) ?: manga
-        return SMangaUpdate(updatedManga, updatedChapters)
+        val updatedManga = comixStep("converting series metadata") {
+            detail?.takeIf { fetchDetails }?.let(::parseMangaDetails) ?: manga
+        }
+        SMangaUpdate(updatedManga, updatedChapters)
     }
 
     private fun JsonObject.mangaDetail(): Manga = entries
@@ -571,14 +575,14 @@ abstract class Comix :
         isDataRequest: ((HttpUrl) -> Boolean)? = null,
         buildScript: ((passPayloadName: String) -> String)? = null,
         pageScript: (passPayloadName: String, rejectName: String, touchName: String) -> String = { _, _, _ -> "" },
-    ): String {
-        val page = WebPage.fetch(client, url, headers)
+    ): String = comixStep("configuring or running the WebView") {
+        val page = comixStep("fetching the WebView document") { WebPage.fetch(client, url, headers) }
         val waitSeconds = if (isDataRequest != null) DATA_REQUEST_WAIT_SECONDS else WEBVIEW_TIMEOUT_SECONDS
         val timeoutDeadline = AtomicLong(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
         val dataRequests = AtomicInteger()
         val (bridgeName, errorBridgeName, passPayloadName, rejectName) = List(4) { randomName() }
         val (touchBridgeName, touchName) = List(2) { randomName() }
-        return runWebView(timeout = Duration.INFINITE) {
+        runWebView(timeout = Duration.INFINITE) {
             userAgent = page.userAgent
             blockImages = true
 
@@ -623,8 +627,16 @@ abstract class Comix :
                     timeoutDeadline.set(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
                 }
                 when (points.size) {
-                    2 -> tap(points[0], points[1])
-                    4 -> swipe(points[0], points[1], points[2], points[3])
+                    2 -> try {
+                        tap(points[0], points[1])
+                    } catch (error: NullPointerException) {
+                        reject(nullFailure("dispatching a native WebView tap", error))
+                    }
+                    4 -> try {
+                        swipe(points[0], points[1], points[2], points[3])
+                    } catch (error: NullPointerException) {
+                        reject(nullFailure("dispatching a native WebView swipe", error))
+                    }
                     else -> throw Exception("Bad touch from the page: $message")
                 }
             }
@@ -672,7 +684,9 @@ abstract class Comix :
         .map { (('a'..'z') + ('A'..'Z')).random() }
         .joinToString("")
 
-    private fun asset(name: String) = javaClass.getResource("/assets/$name")!!.readText()
+    private fun asset(name: String) = requireNotNull(javaClass.getResource("/assets/$name")) {
+        "Comix 1.6.60: the app could not open packaged resource $name"
+    }.readText()
 
     private fun HttpUrl.isChapterListRequest(): Boolean = pathSegments.size == 5 &&
         pathSegments[0] == "api" &&
