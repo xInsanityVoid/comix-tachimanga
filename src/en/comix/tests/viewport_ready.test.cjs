@@ -40,12 +40,13 @@ test("zero or invalid browser dimensions fail within five seconds without starti
     }
 });
 
-function bootstrapHost(layout) {
+function bootstrapHost(layout, requiresNativeInput = true) {
     const source = fs.readFileSync(path.join(__dirname, "../src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt"), "utf8");
     let bootstrap = source.match(/val bootstrapScript = """([\s\S]*?)"""\.trimIndent\(\)/)[1]
         .replace('${asset("viewport_ready.js")}', script)
         .replace('${pageScript(passPayloadName, rejectName, touchName)}', 'window.controlsStarted = true;')
-        .replaceAll('$startFlagName', 'window.started');
+        .replaceAll('$startFlagName', 'window.started')
+        .replaceAll('$requiresNativeInput', String(requiresNativeInput));
     for (const name of ['passPayloadName', 'bridgeName', 'rejectName', 'errorBridgeName', 'touchName', 'touchBridgeName']) {
         bootstrap = bootstrap.replaceAll('$' + name, name);
     }
@@ -76,4 +77,12 @@ test("production bootstrap reports an unsupported viewport through the error bri
     assert.equal(browser.window.controlsStarted, undefined);
     assert.equal(browser.errors.length, 1);
     assert.match(browser.errors[0], /Comix63: browser viewport stayed 0x0 after layout/);
+});
+
+test("browse bootstrap runs immediately even when host dimensions remain zero", async () => {
+    const browser = bootstrapHost(undefined, false);
+    assert.equal(browser.window.controlsStarted, true);
+    await browser.completion;
+    assert.deepEqual(browser.errors, []);
+    assert.equal(browser.window.innerWidth, 0);
 });

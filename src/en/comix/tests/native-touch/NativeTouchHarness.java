@@ -16,7 +16,7 @@ public final class NativeTouchHarness {
         WebView unsupported=new WebView(0);
         unsupported.ignoreLayout=true;
         try { ViewportKt.configureViewport(new WebViewScope<>(unsupported)); throw new AssertionError("ignored failed layout"); }
-        catch(IllegalStateException expected) { check(expected.getMessage().contains("host did not size"),"missing layout diagnostic"); }
+        catch(IllegalStateException expected) { check(expected.getMessage().contains("app WebView layout unavailable"),"missing layout diagnostic"); }
         check(unsupported.events.isEmpty(),"sent input to unsized view");
         for (int nativeWidth : new int[] {360,720,1080}) {
             float scale=nativeWidth/360f;

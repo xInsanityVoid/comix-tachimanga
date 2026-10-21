@@ -32,7 +32,6 @@ internal object Reader {
         var stage = "loading the chapter document"
         val snapshot = try {
             runWebView<Snapshot>(timeout = 18.seconds) {
-                configureViewport()
                 userAgent = page.userAgent
                 // Let the site's reader load normally, including its image and script hosts.
                 blockImages = false

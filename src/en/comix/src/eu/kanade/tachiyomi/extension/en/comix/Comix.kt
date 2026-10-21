@@ -480,7 +480,11 @@ abstract class Comix :
         knownIds: List<Int>,
     ): ChapterList {
         val mangaId = manga.url.removePrefix("/").substringBefore('-')
-        val payload = runInWebView(getMangaUrl(manga), { it.isChapterListRequest() }) { passPayloadName, _, touchName ->
+        val payload = runInWebView(
+            getMangaUrl(manga),
+            { it.isChapterListRequest() },
+            requiresNativeInput = true,
+        ) { passPayloadName, _, touchName ->
             "(${asset("chapter_list.js")})(${asset("chapter_list_snapshot.js")}, " +
                 "${knownIds.joinToString(",", "[", "]")}, ${JSONObject.quote("/title/$mangaId-")}, " +
                 "$MAX_CHAPTER_PAGES, window.$touchName, window.$passPayloadName);"
@@ -573,6 +577,7 @@ abstract class Comix :
     private suspend fun runInWebView(
         url: String,
         isDataRequest: ((HttpUrl) -> Boolean)? = null,
+        requiresNativeInput: Boolean = false,
         buildScript: ((passPayloadName: String) -> String)? = null,
         pageScript: (passPayloadName: String, rejectName: String, touchName: String) -> String = { _, _, _ -> "" },
     ): String = comixStep("WebView run") {
@@ -585,7 +590,7 @@ abstract class Comix :
         runWebView(timeout = Duration.INFINITE) {
             var setupStep = "viewport layout"
             try {
-                configureViewport()
+                if (requiresNativeInput) configureViewport()
                 setupStep = "user agent"
                 userAgent = page.userAgent
                 setupStep = "image settings"
@@ -696,7 +701,7 @@ abstract class Comix :
                 window.$passPayloadName = payload => window.$bridgeName.post(payload);
                 window.$rejectName = message => window.$errorBridgeName.post(message);
                 window.$touchName = points => window.$touchBridgeName.postMessage([window.innerWidth, ...points].join(","));
-                await (${asset("viewport_ready.js")})();
+                if ($requiresNativeInput) await (${asset("viewport_ready.js")})();
                 ${pageScript(passPayloadName, rejectName, touchName)}
                 })().catch(error => window.$rejectName(error.message || String(error)));
                 """.trimIndent()

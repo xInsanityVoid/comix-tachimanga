@@ -17,7 +17,7 @@ internal fun WebViewScope<*>.configureViewport() = withNativeWebView { view ->
         )
         view.layout(0, 0, width, height)
         check(view.width > 0 && view.height > 0) {
-            "Comix63: host did not size the WebView (${view.width}x${view.height})"
+            "Comix: app WebView layout unavailable (${view.width}x${view.height}); chapter controls need app support"
         }
     } catch (error: NullPointerException) {
         reject(nullFailure("viewport layout", error))
