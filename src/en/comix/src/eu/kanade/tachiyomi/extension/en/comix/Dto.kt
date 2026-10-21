@@ -16,10 +16,6 @@ const val CHAPTER_ID_MEMO = "chapterId"
 const val CHAPTER_VOTES_MEMO = "votes"
 const val CHAPTER_OFFICIAL_MEMO = "official"
 const val CHAPTER_GROUP_ID_MEMO = "groupId"
-const val CHAPTER_LIST_DEDUPLICATED_MEMO = "chapterListDeduplicated"
-const val CHAPTER_LIST_BLACKLIST_MEMO = "chapterListBlacklist"
-const val CHAPTER_LIST_COMPLETE_MEMO = "chapterListComplete"
-const val CHAPTER_LIST_FETCHED_AT_MEMO = "chapterListFetchedAt"
 
 @Serializable
 class Term(
@@ -266,6 +262,18 @@ class SearchResponse(
 class ChapterList(
     val chapters: List<Chapter>,
     val complete: Boolean,
+    val error: String? = null,
+    val queries: JsonObject? = null,
+)
+
+@Serializable
+class ChapterPageSnapshot(
+    val status: String,
+    val page: Int = 0,
+    val from: Int = 0,
+    val to: Int = 0,
+    val total: Int = 0,
+    val chapters: List<Chapter> = emptyList(),
     val error: String? = null,
     val queries: JsonObject? = null,
 )
