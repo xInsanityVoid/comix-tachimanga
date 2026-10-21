@@ -17,7 +17,7 @@ internal object Reader {
     private val captureScript by lazy { asset("chapter_pages.js") }
 
     @OptIn(NativeWebViewApi::class)
-    suspend fun pages(url: String, chapterId: Int, userAgent: String): List<Page> {
+    suspend fun pages(page: WebPage, chapterId: Int): List<Page> {
         val stateName = "comixReader" + UUID.randomUUID().toString().replace("-", "")
         val script = """
             (() => {
@@ -32,13 +32,13 @@ internal object Reader {
         var stage = "loading the chapter document"
         val snapshot = try {
             runWebView<Snapshot>(timeout = 18.seconds) {
-                this.userAgent = userAgent
+                userAgent = page.userAgent
                 // Let the site's reader load normally, including its image and script hosts.
                 blockImages = false
                 withNativeWebView { it.settings.setSupportMultipleWindows(true) }
                 onReceivedError { request, error ->
                     if (request.isForMainFrame) {
-                        reject(Exception("Comix reader v57: ${error.description}"))
+                        reject(Exception("Comix reader v58: ${error.description}"))
                     }
                 }
                 val evaluating = AtomicBoolean()
@@ -46,30 +46,30 @@ internal object Reader {
                     if (!evaluating.compareAndSet(false, true)) return@poll
                     evaluateJs(script) { value ->
                         evaluating.set(false)
-                        if (value == null || value == "null") return@evaluateJs
+                        if (value == "null") return@evaluateJs
                         val result = runCatching { value.parseAs<String>().parseAs<Snapshot>() }
                             .getOrElse {
-                                reject(Exception("Comix reader v57: could not read the WebView result", it))
+                                reject(Exception("Comix reader v58: could not read the WebView result", it))
                                 return@evaluateJs
                             }
                         stage = result.stage
                         when (result.status) {
                             "ready" -> resolve(result)
-                            "error" -> reject(Exception("Comix reader v57: ${result.error ?: result.stage}"))
+                            "error" -> reject(Exception("Comix reader v58: ${result.error ?: result.stage}"))
                             "waiting" -> Unit
-                            else -> reject(Exception("Comix reader v57: unexpected reader state"))
+                            else -> reject(Exception("Comix reader v58: unexpected reader state"))
                         }
                     }
                 }
-                loadUrl(url)
+                loadData(page.url, page.html)
             }
         } catch (_: WebViewTimeoutException) {
-            throw Exception("Comix reader v57: $stage did not finish within 18 seconds")
+            throw Exception("Comix reader v58: $stage did not finish within 18 seconds")
         }
-        val images = snapshot.items ?: throw Exception("Comix reader v57: missing images")
-        check(snapshot.count == images.size && images.isNotEmpty()) { "Comix reader v57: incomplete chapter" }
+        val images = snapshot.items ?: throw Exception("Comix reader v58: missing images")
+        check(snapshot.count == images.size && images.isNotEmpty()) { "Comix reader v58: incomplete chapter" }
         return images.mapIndexed { index, image ->
-            check(image.number == index + 1 && image.url.toHttpUrlOrNull() != null) { "Comix reader v57: invalid page ${index + 1}" }
+            check(image.number == index + 1 && image.url.toHttpUrlOrNull() != null) { "Comix reader v58: invalid page ${index + 1}" }
             Page(index, imageUrl = image.url)
         }
     }

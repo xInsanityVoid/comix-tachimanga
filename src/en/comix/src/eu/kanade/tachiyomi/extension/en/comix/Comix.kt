@@ -567,7 +567,8 @@ abstract class Comix :
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterId = chapter.chapterId() ?: throw Exception("Could not find the chapter id")
-        return Reader.pages(getChapterUrl(chapter), chapterId, headers["User-Agent"].orEmpty())
+        val page = WebPage.fetch(client, getChapterUrl(chapter), headers)
+        return Reader.pages(page, chapterId)
     }
 
     override fun getFilterList(data: JsonElement?) = sourceFilters().getFilterList()
@@ -579,13 +580,14 @@ abstract class Comix :
         buildScript: ((passPayloadName: String) -> String)? = null,
         pageScript: (passPayloadName: String, rejectName: String, touchName: String) -> String = { _, _, _ -> "" },
     ): String {
+        val page = WebPage.fetch(client, url, headers)
         val waitSeconds = if (isDataRequest != null) DATA_REQUEST_WAIT_SECONDS else WEBVIEW_TIMEOUT_SECONDS
         val timeoutDeadline = AtomicLong(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
         val dataRequests = AtomicInteger()
         val (bridgeName, errorBridgeName, passPayloadName, rejectName) = List(4) { randomName() }
         val (touchBridgeName, touchName) = List(2) { randomName() }
         return runWebView(timeout = Duration.INFINITE) {
-            userAgent = headers["User-Agent"].orEmpty()
+            userAgent = page.userAgent
             blockImages = true
 
             val emptyResponse = WebResourceResponse("text/plain", "utf-8", Buffer().inputStream())
@@ -621,7 +623,7 @@ abstract class Comix :
 
             jsBridge(bridgeName) { resolve(it) }
             jsBridge(errorBridgeName) { reject(Exception(it)) }
-            val siteOrigin = url.toHttpUrl().run { "$scheme://$host" }
+            val siteOrigin = page.url.toHttpUrl().run { "$scheme://$host" }
             webMessageBridge(touchBridgeName, setOf(siteOrigin)) { message ->
                 val points = message.split(',').mapNotNull { it.toFloatOrNull() }
                 when (points.size) {
@@ -666,7 +668,7 @@ abstract class Comix :
                 })();
             """.trimIndent()
             injectAtDocumentStart(bootstrapScript, setOf(siteOrigin))
-            loadUrl(url)
+            loadData(page.url, page.html)
         }
     }
 
