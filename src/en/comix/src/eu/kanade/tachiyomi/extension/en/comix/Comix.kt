@@ -27,13 +27,14 @@ import keiyoushi.utils.booleanOrNull
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.int
+import keiyoushi.utils.intOrNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.runWebView
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.Headers
@@ -51,11 +52,7 @@ import uy.kohesive.injekt.api.get
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
-import kotlin.random.Random
-import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
-import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
 
 @Source
@@ -117,19 +114,6 @@ abstract class Comix :
         .rateLimit(5)
 
     private val baseUrlHost get() = baseUrl.toHttpUrl().host
-
-    private class RequestPacer(private val minGapMs: Long, private val maxGapMs: Long) {
-        private val mutex = Mutex()
-        private var nextNanos = 0L
-
-        suspend fun waitForSlot() {
-            mutex.withLock {
-                val waitNanos = nextNanos - System.nanoTime()
-                if (waitNanos > 0) delay(waitNanos.nanoseconds)
-                nextNanos = System.nanoTime() + Random.nextLong(minGapMs, maxGapMs) * 1_000_000
-            }
-        }
-    }
 
     private fun altHostFallback(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -440,7 +424,7 @@ abstract class Comix :
         chapters: List<SChapter>,
         fetchDetails: Boolean,
         fetchChapters: Boolean,
-    ): SMangaUpdate {
+    ): SMangaUpdate = withTimeoutOrNull(UPDATE_TIMEOUT_SECONDS.seconds) {
         var cachedQueries: JsonObject? = null
         suspend fun getQueries(): JsonObject {
             cachedQueries?.let { return it }
@@ -449,13 +433,33 @@ abstract class Comix :
 
         val deduplicateChapters = preferences.deduplicateChapters()
         val scanlatorBlacklist = preferences.scanlatorBlacklist()
+        val snapshotFilters = buildJsonObject {
+            put("deduplicate", deduplicateChapters)
+            put("blacklist", JsonArray(scanlatorBlacklist.sorted().map { JsonPrimitive(it) }))
+        }
         var walkedQueries: JsonObject? = null
+        var completedSnapshot: ChapterList? = null
         val updatedChapters = if (fetchChapters) {
             val knownDates = chapters.mapNotNull { chapter ->
                 chapter.chapterId()?.let { it to chapter.date_upload }?.takeIf { it.second > 0 }
             }.toMap()
             val mangaSlug = manga.url.removePrefix("/")
-            val chapterList = getWebViewChapterList(manga)
+            val storedIds = manga.chapterSnapshotIds(CHAPTER_SNAPSHOT_IDS_MEMO)
+            val storedIdSet = storedIds.toSet()
+            val storedSelectedIds = manga.chapterSnapshotIds(CHAPTER_SNAPSHOT_SELECTED_IDS_MEMO)
+            val currentIds = chapters.mapNotNull { it.chapterId()?.takeIf { id -> id > 0 } }
+            val currentIdSet = currentIds.toSet()
+            val snapshotIds = if (
+                manga.memo[CHAPTER_SNAPSHOT_FILTERS_MEMO] == snapshotFilters &&
+                chapters.isNotEmpty() && currentIds.size == chapters.size && currentIdSet.size == chapters.size &&
+                currentIdSet == storedSelectedIds.toSet() && storedSelectedIds.all { it in storedIdSet }
+            ) {
+                storedIds
+            } else {
+                emptyList()
+            }
+            val chapterList = getWebViewChapterList(manga, snapshotIds)
+            completedSnapshot = chapterList
 
             walkedQueries = chapterList.queries?.also {
                 cachedQueries = it
@@ -464,7 +468,8 @@ abstract class Comix :
             val fetched = chapterList.chapters.map { it.toSChapter(mangaSlug) }.onEach { chapter ->
                 chapter.chapterId()?.let(knownDates::get)?.let { chapter.date_upload = it }
             }
-            selectChapters(fetched, deduplicateChapters, scanlatorBlacklist)
+            val candidates = if (chapterList.incremental) fetched + chapters else fetched
+            selectChapters(candidates, deduplicateChapters, scanlatorBlacklist)
         } else {
             chapters
         }
@@ -475,8 +480,20 @@ abstract class Comix :
             else -> getQueries().mangaDetail()
         }
         val updatedManga = detail?.takeIf { fetchDetails }?.let(::parseMangaDetails) ?: manga
-        return SMangaUpdate(updatedManga, updatedChapters)
-    }
+        updatedManga.memo = buildJsonObject {
+            manga.memo.forEach { (key, value) -> put(key, value) }
+            updatedManga.memo.forEach { (key, value) -> put(key, value) }
+            completedSnapshot?.let {
+                val selectedIds = updatedChapters.map { chapter ->
+                    chapter.chapterId() ?: throw Exception("A selected chapter is missing its ID")
+                }
+                put(CHAPTER_SNAPSHOT_IDS_MEMO, JsonArray(it.chapterIds.map { id -> JsonPrimitive(id) }))
+                put(CHAPTER_SNAPSHOT_SELECTED_IDS_MEMO, JsonArray(selectedIds.map { id -> JsonPrimitive(id) }))
+                put(CHAPTER_SNAPSHOT_FILTERS_MEMO, snapshotFilters)
+            }
+        }
+        SMangaUpdate(updatedManga, updatedChapters)
+    } ?: throw IOException("Comix did not finish loading within $UPDATE_TIMEOUT_SECONDS seconds. The request was stopped; you can retry.")
 
     private fun JsonObject.mangaDetail(): Manga = entries
         .firstOrNull { (key, _) -> key.contains("\"detail\"") }
@@ -548,68 +565,42 @@ abstract class Comix :
             ?.substringBefore("-chapter-")
             ?.toIntOrNull()
 
-    private suspend fun getWebViewChapterList(manga: SManga): ChapterList {
-        showChapterListHint()
-        val mangaId = manga.url.removePrefix("/").substringBefore('-')
-        val chapterPath = JSONObject.quote("/title/$mangaId-")
-        val mangaUrl = getMangaUrl(manga).toHttpUrl()
-        val capture = asset("chapter_page.js")
-        val chapters = mutableListOf<Chapter>()
-        val chapterIds = mutableSetOf<Int>()
-        var queries: JsonObject? = null
-        var expectedTotal: Int? = null
-        var nextFrom = 1
+    private fun SManga.chapterSnapshotIds(key: String): List<Int> {
+        val stored = memo[key] as? JsonArray ?: return emptyList()
+        val ids = stored.map { (it as? JsonPrimitive)?.intOrNull ?: return emptyList() }
+        return ids.takeIf { it.all { id -> id > 0 } && it.toSet().size == it.size }.orEmpty()
+    }
 
-        for (page in 1..MAX_CHAPTER_PAGES) {
-            chapterListPacer.waitForSlot()
-            val pageUrl = mangaUrl.newBuilder()
-                .setQueryParameter("page", page.toString())
-                .build()
-                .toString()
-            val payload = runInWebView(
-                url = pageUrl,
-                isDataRequest = { it.isChapterListRequest() },
-                buildScript = { passPayloadName ->
-                    """
-                    (function () {
-                        if (typeof window.$passPayloadName !== 'function') return;
-                        try {
-                            const snapshot = ($capture)($chapterPath, $page, $nextFrom);
-                            if (snapshot.status !== 'waiting') {
-                                window.$passPayloadName(JSON.stringify(snapshot));
-                            }
-                        } catch (error) {
-                            window.$passPayloadName(JSON.stringify({ status: 'error', error: String(error) }));
-                        }
-                    })();
-                    """.trimIndent()
-                },
-            )
-            val snapshot = payload.parseAs<ChapterPageSnapshot>()
-            if (snapshot.status != "ready") {
-                throw Exception(snapshot.error ?: "Could not read chapter list page $page")
-            }
-            if (snapshot.page != page || snapshot.from != nextFrom || snapshot.to < snapshot.from ||
-                snapshot.total < snapshot.to || snapshot.chapters.size != snapshot.to - snapshot.from + 1
-            ) {
-                throw Exception("Comix returned inconsistent chapter pagination on page $page")
-            }
-            if (expectedTotal != null && snapshot.total != expectedTotal) {
-                throw Exception("The chapter list changed while loading. Refresh to try again.")
-            }
-            if (snapshot.chapters.any { it.id <= 0 || !chapterIds.add(it.id) }) {
-                throw Exception("Comix repeated a chapter while loading page $page")
-            }
-            if (page == 1) queries = snapshot.queries
-            expectedTotal = snapshot.total
-            chapters.addAll(snapshot.chapters)
-            if (snapshot.to == expectedTotal) {
-                if (chapters.size != expectedTotal) throw Exception("The chapter list is incomplete")
-                return ChapterList(chapters, complete = true, queries = queries)
-            }
-            nextFrom = snapshot.to + 1
+    private suspend fun getWebViewChapterList(manga: SManga, snapshotIds: List<Int>): ChapterList {
+        if (snapshotIds.isEmpty()) showChapterListHint()
+        val mangaId = manga.url.removePrefix("/").substringBefore('-')
+        val knownIds = JsonArray(snapshotIds.map { JsonPrimitive(it) })
+        val payload = runInWebView(getMangaUrl(manga), { it.isChapterListRequest() }) { passPayloadName, rejectName ->
+            "(${asset("chapters.js")})(${asset("vendor.js")}, " +
+                "${JSONObject.quote(mangaId)}, ${JSONObject.quote("/title/$mangaId-")}, $knownIds, " +
+                "window.$passPayloadName, window.$rejectName);"
         }
-        throw Exception("The chapter list exceeds $MAX_CHAPTER_PAGES pages")
+        val chapterList = payload.parseAs<ChapterList>()
+        if (!chapterList.complete) throw Exception(chapterList.error ?: "The chapter list is incomplete")
+        val chapterIds = chapterList.chapterIds.toSet()
+        val fetchedIds = chapterList.chapters.map { it.id }
+        if (chapterList.total < 0 || chapterIds.size != chapterList.total ||
+            chapterIds.size != chapterList.chapterIds.size || chapterIds.any { it <= 0 } ||
+            fetchedIds.toSet().size != fetchedIds.size || fetchedIds.any { it !in chapterIds }
+        ) {
+            throw Exception("Comix returned an inconsistent chapter snapshot")
+        }
+        val expectedIds = if (chapterList.incremental) {
+            val knownIdSet = snapshotIds.toSet()
+            if (knownIdSet.isEmpty() || fetchedIds.none { it in knownIdSet }) {
+                throw Exception("Comix returned an incomplete chapter refresh")
+            }
+            knownIdSet + fetchedIds
+        } else {
+            fetchedIds.toSet()
+        }
+        if (expectedIds != chapterIds) throw Exception("The chapter list is incomplete")
+        return chapterList
     }
 
     private fun selectChapters(
@@ -719,11 +710,10 @@ abstract class Comix :
         buildScript: ((passPayloadName: String) -> String)? = null,
         pageScript: (passPayloadName: String, rejectName: String) -> String = { _, _ -> "" },
     ): String {
-        val waitSeconds = if (isDataRequest != null) DATA_REQUEST_WAIT_SECONDS else WEBVIEW_TIMEOUT_SECONDS
-        val timeoutDeadline = AtomicLong(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
+        val timeoutDeadline = System.nanoTime() + WEBVIEW_TIMEOUT_SECONDS.seconds.inWholeNanoseconds
         val dataRequests = AtomicInteger()
         val (bridgeName, errorBridgeName, passPayloadName, rejectName) = List(4) { randomName() }
-        return runWebView(timeout = Duration.INFINITE) {
+        return runWebView(timeout = WEBVIEW_TIMEOUT_SECONDS.seconds) {
             userAgent = headers["User-Agent"].orEmpty()
             blockImages = true
 
@@ -744,9 +734,6 @@ abstract class Comix :
                 }
                 val isData = isDataRequest?.invoke(requestUrl) == true
                 if (isData) dataRequests.incrementAndGet()
-                if (isData || requestUrl.encodedPath.startsWith(WAF_PATH)) {
-                    timeoutDeadline.set(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
-                }
                 val allowed = requestUrl.host == baseUrlHost ||
                     requestUrl.host.endsWith(".$baseUrlHost") ||
                     requestUrl.host == "comix.to" ||
@@ -768,7 +755,7 @@ abstract class Comix :
                 onPageFinished { evaluateJs(captureScript) }
             }
             poll(SCRIPT_RETRY_INTERVAL_MS.milliseconds) {
-                if (System.nanoTime() >= timeoutDeadline.get()) {
+                if (System.nanoTime() >= timeoutDeadline) {
                     val message = when {
                         isDataRequest == null -> "Timed out waiting for WebView"
                         dataRequests.get() == 0 -> "Site never requested the data"
@@ -981,12 +968,13 @@ abstract class Comix :
         private const val PREF_SOLVE_CAPTCHA = "pref_solve_captcha"
 
         private const val DEFAULT_CONTENT_RATING = "suggestive"
-        private const val WEBVIEW_TIMEOUT_SECONDS = 120L
-        private const val DATA_REQUEST_WAIT_SECONDS = 30L
+        private const val UPDATE_TIMEOUT_SECONDS = 15L
+        private const val WEBVIEW_TIMEOUT_SECONDS = 15L
         private val RECENT_QUERIES_TTL_NANOS = 120.seconds.inWholeNanoseconds
         private const val SCRIPT_RETRY_INTERVAL_MS = 100L
-        private const val MAX_CHAPTER_PAGES = 1000
-        private val chapterListPacer = RequestPacer(minGapMs = 2500, maxGapMs = 5000)
+        private const val CHAPTER_SNAPSHOT_IDS_MEMO = "chapterSnapshotIdsV1"
+        private const val CHAPTER_SNAPSHOT_SELECTED_IDS_MEMO = "chapterSnapshotSelectedIdsV1"
+        private const val CHAPTER_SNAPSHOT_FILTERS_MEMO = "chapterSnapshotFiltersV1"
         private const val OFFICIAL_GROUP_ID = 10702
         private const val TAG_ID_CACHE_SIZE = 50
         private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
@@ -996,7 +984,5 @@ abstract class Comix :
         private val UNUSED_SITE_PATHS = listOf("/api/v1/client-errors", "/api/v1/threads/", "/assets/uploads/")
 
         private const val WAF_CHALLENGE_PATH = "/@waf/challenge"
-
-        private const val WAF_PATH = "/@waf/"
     }
 }

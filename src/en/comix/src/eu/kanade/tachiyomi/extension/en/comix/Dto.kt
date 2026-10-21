@@ -262,18 +262,9 @@ class SearchResponse(
 class ChapterList(
     val chapters: List<Chapter>,
     val complete: Boolean,
-    val error: String? = null,
-    val queries: JsonObject? = null,
-)
-
-@Serializable
-class ChapterPageSnapshot(
-    val status: String,
-    val page: Int = 0,
-    val from: Int = 0,
-    val to: Int = 0,
-    val total: Int = 0,
-    val chapters: List<Chapter> = emptyList(),
+    val incremental: Boolean,
+    val chapterIds: List<Int>,
+    val total: Int,
     val error: String? = null,
     val queries: JsonObject? = null,
 )
