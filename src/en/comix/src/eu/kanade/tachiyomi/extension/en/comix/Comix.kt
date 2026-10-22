@@ -66,6 +66,8 @@ abstract class Comix :
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
+    private val clearanceMigration by lazy { ClearanceMigration(preferences, client.cookieJar) }
+
     private val chapterListHintShown = AtomicBoolean(false)
 
     private fun showChapterListHint() {
@@ -717,6 +719,7 @@ abstract class Comix :
         buildScript: ((passPayloadName: String) -> String)? = null,
         pageScript: (passPayloadName: String, rejectName: String) -> String = { _, _ -> "" },
     ): String {
+        clearanceMigration.run(headers["User-Agent"].orEmpty())
         val timeoutDeadline = System.nanoTime() + WEBVIEW_TIMEOUT_SECONDS.seconds.inWholeNanoseconds
         val dataRequests = AtomicInteger()
         val (bridgeName, errorBridgeName, passPayloadName, rejectName) = List(4) { randomName() }
@@ -780,7 +783,7 @@ abstract class Comix :
                                 ?.parseAs<ConnectionCheck>()
                         }.getOrNull() ?: return@evaluateJs
                         if (result.phase == "PENDING") return@evaluateJs
-                        Log.i("Comix", "1.6.71 connection: ${result.toJsonString()}")
+                        Log.i("Comix", "1.6.72 connection: ${result.toJsonString()}")
                         reject(IOException("Comix: the site blocked this WebView (${result.summary()})"))
                     }
                 }
@@ -793,7 +796,7 @@ abstract class Comix :
                         val summary = state.summary()
                         if (summary != lastDocumentState) {
                             lastDocumentState = summary
-                            Log.i("Comix", "1.6.71 WebView: $summary")
+                            Log.i("Comix", "1.6.72 WebView: $summary")
                         }
                         when {
                             state.ready == DocumentReady.COMPLETE && state.kind == DocumentKind.THIRD_PARTY_BLOCK ->
