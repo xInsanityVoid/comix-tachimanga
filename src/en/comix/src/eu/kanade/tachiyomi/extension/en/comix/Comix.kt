@@ -32,6 +32,7 @@ import keiyoushi.utils.int
 import keiyoushi.utils.intOrNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.runWebView
+import keiyoushi.utils.toJsonString
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
@@ -771,6 +772,18 @@ abstract class Comix :
                 }
 
                 val documentStateScript = "(${asset("document-state.js")})(${JSONObject.quote(passPayloadName)})"
+                val connectionCheckScript = "(${asset("connection-check.js")})(${JSONObject.quote(headers["User-Agent"].orEmpty())})"
+                fun reportBlockedConnection() {
+                    evaluateJs(connectionCheckScript) { value ->
+                        val result = runCatching {
+                            value.parseAs<JsonPrimitive>().takeIf { it.isString }?.content
+                                ?.parseAs<ConnectionCheck>()
+                        }.getOrNull() ?: return@evaluateJs
+                        if (result.phase == "PENDING") return@evaluateJs
+                        Log.i("Comix", "1.6.71 connection: ${result.toJsonString()}")
+                        reject(IOException("Comix: the site blocked this WebView (${result.summary()})"))
+                    }
+                }
                 fun observeDocumentState() {
                     evaluateJs(documentStateScript) { value ->
                         val state = runCatching {
@@ -780,11 +793,11 @@ abstract class Comix :
                         val summary = state.summary()
                         if (summary != lastDocumentState) {
                             lastDocumentState = summary
-                            Log.i("Comix", "1.6.70 WebView: $summary")
+                            Log.i("Comix", "1.6.71 WebView: $summary")
                         }
                         when {
                             state.ready == DocumentReady.COMPLETE && state.kind == DocumentKind.THIRD_PARTY_BLOCK ->
-                                reject(IOException("Comix: this browser received the site's third-party-app block ($summary)"))
+                                reportBlockedConnection()
                             state.ready == DocumentReady.COMPLETE && state.kind == DocumentKind.HTTP_503 ->
                                 reject(IOException("Comix: the WebView document returned HTTP 503 ($summary)"))
                         }
@@ -828,6 +841,24 @@ abstract class Comix :
         } catch (error: WebViewTimeoutException) {
             throw IOException("Comix: WebView timed out ($lastDocumentState; requests=${dataRequests.get()})", error)
         }
+    }
+
+    @Serializable
+    private class ConnectionCheck(
+        val phase: String,
+        private val runtimeUa: String,
+        private val echoedUa: String,
+        private val runtimeMatches: Boolean?,
+        private val echoedMatches: Boolean?,
+        private val status: Int,
+    ) {
+        private fun Boolean?.label() = when (this) {
+            true -> "MATCH"
+            false -> "DIFFERENT"
+            null -> "UNKNOWN"
+        }
+
+        fun summary() = "browserUA=${runtimeMatches.label()} sentUA=${echoedMatches.label()} trace=$phase/$status"
     }
 
     @Serializable
